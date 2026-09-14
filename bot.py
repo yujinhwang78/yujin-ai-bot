@@ -1485,6 +1485,21 @@ def _is_stale_recv_date(vals: dict, period_start: dt.date) -> str | None:
 SKIP_FILL_FIELDS = {"월별"}
 
 
+def _fill_row_by_period(ws, header_map: dict, row: int, row_date, period_start: dt.date, period_end: dt.date) -> None:
+    """한 행에 대해 접수일자(row_date)가 이번 정산 기간 안이면 노란색, 아니면 흰색(음영 없음)으로
+    칠함. _recolor_by_period와 완전히 같은 규칙을, 새로 쓴 행 하나에 즉시 적용할 때 씀
+    (전체 재계산 pass를 기다리지 않고 그 자리에서 바로 색이 반영되도록 하기 위한 안전장치)."""
+    in_period = row_date is not None and period_start <= row_date <= period_end
+    fill = YELLOW_FILL if in_period else NO_FILL
+    for key, idx in header_map.items():
+        if key in SKIP_FILL_FIELDS:
+            continue
+        cell = ws.cell(row=row, column=idx + 1)
+        if isinstance(cell, MergedCell):
+            continue
+        cell.fill = fill
+
+
 def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date, period_end: dt.date) -> None:
     """접수일자가 이번 정산 기간(16일~다음달 15일) 안이면 노란색, 기간이 지난 항목이면 다시
     흰색(음영 없음)으로 되돌림. 월별 칸(정산기간 라벨)만 그대로 두고, 순번을 포함한 나머지
@@ -1500,15 +1515,7 @@ def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date
             continue
         date_val = ws.cell(row=r, column=date_idx + 1).value
         row_date = _parse_date_val(date_val)
-        in_period = row_date is not None and period_start <= row_date <= period_end
-        fill = YELLOW_FILL if in_period else NO_FILL
-        for key, idx in header_map.items():
-            if key in SKIP_FILL_FIELDS:
-                continue
-            cell = ws.cell(row=r, column=idx + 1)
-            if isinstance(cell, MergedCell):
-                continue
-            cell.fill = fill
+        _fill_row_by_period(ws, header_map, r, row_date, period_start, period_end)
 
 
 def _extract_rate(ws, header_map: dict, field: str, pattern: str, default: float, min_row: int) -> float:
@@ -2069,6 +2076,9 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             target_row = _rollover_period_block(master_ws, master_header, target_row, current_period_label)
             template_row = _find_template_row(master_ws, master_header, master_min_row, target_row)
             _write_row(master_ws, master_header, target_row, vals, template_row)
+            # 접수일자(=오늘, 처리일) 기준으로 즉시 색칠. 보험시작일 등 다른 날짜 칸과
+            # 헷갈리지 않도록, 전체 재계산(_recolor_by_period)을 기다리지 않고 이 자리에서 바로 반영.
+            _fill_row_by_period(master_ws, master_header, target_row, vals.get("접수일자"), period_start, period_end)
 
             cert_vals = _compute_new_store_cert_values(vals, rate1, rate2)
             address = str(vals.get("매장주소") or "").strip()
@@ -2132,6 +2142,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             target_row = _rollover_period_block(master_ws, master_header, target_row, current_period_label)
             template_row = _find_template_row(master_ws, master_header, master_min_row, target_row)
             _write_row(master_ws, master_header, target_row, vals, template_row)
+            _fill_row_by_period(master_ws, master_header, target_row, vals.get("접수일자"), period_start, period_end)
             closed_count += 1
             # 이 행이 통합파일의 '폐점매장' 시트에 그대로 저장되므로(_write_row), 이 매장이
             # '신규매장'으로 기록된 적이 없어도 나중에 _all_closed_store_rows()로 브랜드/
