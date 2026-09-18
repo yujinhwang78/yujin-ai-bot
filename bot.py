@@ -36,11 +36,13 @@ try:
     from google.auth.transport.requests import Request as _gdrive_auth_request
     from googleapiclient.discovery import build as _gdrive_build
     from googleapiclient.http import MediaInMemoryUpload as _gdrive_media
+    from googleapiclient.http import MediaIoBaseDownload as _gdrive_media_download
 except ImportError:
     _gdrive_user_credentials = None
     _gdrive_auth_request = None
     _gdrive_build = None
     _gdrive_media = None
+    _gdrive_media_download = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -2652,6 +2654,37 @@ def _gdrive_find_child_folder(service, parent_id: str, predicate) -> str | None:
     return None
 
 
+def _gdrive_find_file(service, parent_id: str, predicate) -> dict | None:
+    """parent_id 밑에 있는 파일들(폴더 제외) 중 predicate(name)이 True인 첫 파일의
+    {"id","name"}을 반환. 없으면 None. 폐점서류 zip처럼 '이미 올려둔 파일이 있으면 그걸
+    이어서 채워야 하는' 경우에 씀."""
+    query = (
+        f"'{parent_id}' in parents and mimeType!='application/vnd.google-apps.folder' "
+        "and trashed=false"
+    )
+    resp = service.files().list(q=query, fields="files(id,name)", pageSize=200).execute()
+    for f in resp.get("files", []):
+        if predicate(f["name"]):
+            return f
+    return None
+
+
+def _gdrive_download_file(service, file_id: str) -> bytes | None:
+    if _gdrive_media_download is None:
+        return None
+    try:
+        request = service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = _gdrive_media_download(buf, request)
+        done = False
+        while not done:
+            _status, done = downloader.next_chunk()
+        return buf.getvalue()
+    except Exception:
+        logger.exception("구글 드라이브 파일 다운로드 중 오류")
+        return None
+
+
 def _gdrive_create_folder(service, parent_id: str, name: str) -> str:
     meta = {
         "name": name,
@@ -2983,20 +3016,38 @@ def _start_closure_buffer(buffers: dict, store_name: str, brand: str, owner_name
     return buf
 
 
-async def _finish_closure_buffer(update: Update, store_name: str, buf: dict) -> None:
-    zip_bytes = _zip_closure_docs(buf["matched"])
+async def _save_and_report_closure_progress(update: Update, store_name: str, buf: dict, buffers: dict) -> None:
+    """폐점서류가 한 개 추가될 때마다 호출함. 4종류가 다 모일 때까지 기다리지 않고, 지금까지
+    모인 것을 그 자리에서 바로 드라이브에 저장함(드라이브에 이미 있던 이전 서류와도 자동으로
+    합쳐짐 - _save_closure_zip_merged 참고). 예전엔 4종류가 다 모일 때까지 봇 메모리에만
+    들고 있어서, 중간에 봇이 재배포되면 그동안 받은 서류가 통째로 날아가는 문제가 있었음
+    (2026-09-18, 유진님 피드백으로 변경)."""
     zip_name = _closure_zip_name(store_name, buf["owner_name"])
     try:
-        saved = _upload_to_drive(
-            zip_name, zip_bytes, brand=buf["brand"], extra_subfolder="폐점서류", mimetype="application/zip",
-        )
+        saved, merged = _save_closure_zip_merged(store_name, buf["owner_name"], buf["brand"], buf["matched"])
     except Exception:
         logger.exception("폐점서류 압축/저장 중 오류")
-        saved = False
+        saved, merged = False, dict(buf["matched"])
+    missing = [c for c in _CLOSURE_DOC_KEYWORDS if c not in merged]
+
+    if not missing:
+        if saved:
+            await update.message.reply_text(f"✅ '{store_name}' 폐점필수서류 4종을 다 모아서 '{zip_name}'로 구글 드라이브에 저장했어요.")
+        else:
+            await update.message.reply_text(f"⚠️ '{store_name}' 서류는 다 모았는데 구글 드라이브 저장에 실패했어요. 드라이브 설정을 확인해주세요.")
+        buffers.pop(store_name, None)
+        return
+
+    n = 4 - len(missing)
     if saved:
-        await update.message.reply_text(f"✅ '{store_name}' 폐점필수서류 4종을 다 모아서 '{zip_name}'로 구글 드라이브에 저장했어요.")
+        await update.message.reply_text(
+            f"💾 '{store_name}' 서류를 구글 드라이브에 저장했어요 ({n}/4). 남은 서류: {', '.join(missing)}"
+        )
     else:
-        await update.message.reply_text("⚠️ 서류는 다 모았는데 구글 드라이브 저장에 실패했어요. 드라이브 설정을 확인해주세요.")
+        await update.message.reply_text(
+            f"⚠️ '{store_name}' 서류를 확인했지만({n}/4) 구글 드라이브 저장에 실패했어요. "
+            f"드라이브 설정을 확인해주세요. 남은 서류: {', '.join(missing)}"
+        )
 
 
 async def _handle_closure_doc_upload(
@@ -3055,16 +3106,7 @@ async def _handle_closure_doc_upload(
 
     buf = buffers[matched_name]
     buf["matched"][category] = (filename, file_bytes)
-    n = len(buf["matched"])
-    if n < 4:
-        missing = [c for c in _CLOSURE_DOC_KEYWORDS if c not in buf["matched"]]
-        await update.message.reply_text(
-            f"📎 '{matched_name}' {category} 확인했어요 ({n}/4). 남은 서류: {', '.join(missing)}"
-        )
-        return
-
-    await _finish_closure_buffer(update, matched_name, buf)
-    buffers.pop(matched_name, None)
+    await _save_and_report_closure_progress(update, matched_name, buf, buffers)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3108,15 +3150,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             _start_closure_buffer(buffers, store_name, brand, owner_name)
         buf = buffers[store_name]
         buf["matched"][category] = (filename, file_bytes)
-        n = len(buf["matched"])
-        if n < 4:
-            missing = [c for c in _CLOSURE_DOC_KEYWORDS if c not in buf["matched"]]
-            await update.message.reply_text(
-                f"📎 '{store_name}' {category} 확인했어요 ({n}/4). 남은 서류: {', '.join(missing)}"
-            )
-        else:
-            await _finish_closure_buffer(update, store_name, buf)
-            buffers.pop(store_name, None)
+        await _save_and_report_closure_progress(update, store_name, buf, buffers)
         return
 
     # 길찾기(출발지/도착지) 입력 중이면 그쪽으로 처리
@@ -3511,6 +3545,65 @@ def _zip_closure_docs(matched: dict) -> bytes:
     return buf.getvalue()
 
 
+def _unzip_closure_docs(zip_bytes: bytes) -> dict:
+    """드라이브에 이미 저장돼 있던 폐점서류 zip을 다시 열어서, 파일명 키워드로 재분류한
+    {category: (filename, file_bytes)} 딕셔너리로 돌려줌(저장할 때도 파일명 기준으로 분류해서
+    넣었으므로, 다시 열 때도 파일명만으로 충분함)."""
+    out = {}
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        for name in zf.namelist():
+            base = os.path.basename(name)
+            category = _classify_closure_doc(base)
+            if category and category not in out:
+                out[category] = (base, zf.read(name))
+    except Exception:
+        logger.exception("기존 폐점서류 zip 압축 해제 중 오류")
+    return out
+
+
+def _save_closure_zip_merged(
+    store_name: str, owner_name: str, brand: str | None, new_matched: dict
+) -> tuple[bool, dict]:
+    """폐점서류를 저장할 때, 드라이브에 이미 같은 매장 zip이 있으면 그 안의 기존 서류와 이번에
+    새로 모인 서류를 합쳐서(겹치는 종류는 새 걸로 덮어씀) 다시 올림. 4종류가 다 안 모였어도
+    매번 그 자리에서 바로 저장하는 이유: 예전엔 봇 메모리(또는 이번 메일 첨부파일)에만 다
+    모일 때까지 들고 있다가 한 번에 저장해서, 중간에 봇이 재배포되거나 나머지 서류가 다른
+    메일/시점에 따로 오면 이전에 받은 서류가 통째로 유실됐음(2026-09-18, 유진님 피드백으로
+    변경). 반환값: (이번 저장 성공 여부, 드라이브 기존 것까지 합친 전체 matched 딕셔너리)."""
+    zip_name = _closure_zip_name(store_name, owner_name)
+    merged = dict(new_matched)
+    service = _get_gdrive_service()
+    if service is None:
+        return False, merged
+    try:
+        parent_id = GDRIVE_FOLDER_ID
+        if brand:
+            resolved = _resolve_drive_target_folder(service, brand, extra_subfolder="폐점서류")
+            if resolved:
+                parent_id = resolved
+        existing = _gdrive_find_file(service, parent_id, lambda name: name == zip_name)
+        if existing is not None:
+            existing_bytes = _gdrive_download_file(service, existing["id"])
+            if existing_bytes is not None:
+                existing_matched = _unzip_closure_docs(existing_bytes)
+                merged = {**existing_matched, **new_matched}
+        zip_bytes = _zip_closure_docs(merged)
+        media = _gdrive_media(zip_bytes, mimetype="application/zip")
+        if existing is not None:
+            service.files().update(fileId=existing["id"], media_body=media).execute()
+        else:
+            service.files().create(
+                body={"name": zip_name, "parents": [parent_id]},
+                media_body=media,
+                fields="id",
+            ).execute()
+        return True, merged
+    except Exception:
+        logger.exception("폐점서류 병합/저장 중 오류")
+        return False, merged
+
+
 def _closure_zip_name(store_name: str, owner_name: str) -> str:
     if owner_name:
         return f"{store_name}_{owner_name}.zip"
@@ -3666,41 +3759,43 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                             # 1) 유진님이 이미 매장별로 압축해서 보낸 zip이 있으면 그걸 그대로 씀
                             existing_zip = _find_store_zip_attachment(store_name, other_attachments)
                             if existing_zip is not None and _zip_has_all_closure_docs(existing_zip[1]):
-                                saved = _upload_to_drive(
-                                    zip_name, existing_zip[1], brand=brand,
-                                    extra_subfolder="폐점서류", mimetype="application/zip",
-                                )
+                                matched = _unzip_closure_docs(existing_zip[1])
                             else:
-                                # 2) 나열된 개별 첨부파일에서 4종류를 찾아 직접 압축(파일명으로 안
-                                # 되면 내용을 직접 열어서도 확인함 - 예: 'OL인천구월점_251112.pdf')
+                                # 2) 나열된 개별 첨부파일에서 4종류를 찾아봄(파일명으로 안 되면
+                                # 내용을 직접 열어서도 확인함 - 예: 'OL인천구월점_251112.pdf')
                                 matched = await _match_closure_docs_with_content(
                                     store_name, other_attachments, allow_no_name_fallback=allow_fallback
                                 )
-                                if len(matched) < 4:
-                                    missing = [c for c in _CLOSURE_DOC_KEYWORDS if c not in matched]
-                                else:
-                                    zip_bytes = _zip_closure_docs(matched)
-                                    saved = _upload_to_drive(
-                                        zip_name, zip_bytes, brand=brand,
-                                        extra_subfolder="폐점서류", mimetype="application/zip",
-                                    )
+                            # 일부만 모였어도 일단 저장함(드라이브에 이미 저장된 게 있으면 합쳐서).
+                            # 예전엔 4종류가 다 갖춰질 때까지 아예 저장을 안 해서, 나머지 서류가
+                            # 뒤늦게 들어와도 이번 메일 것만으로는 매번 처음부터 다시 모아야
+                            # 했음(유진님 피드백으로 변경, 2026-09-18).
+                            saved, merged = _save_closure_zip_merged(store_name, owner_name, brand, matched)
+                            missing = [c for c in _CLOSURE_DOC_KEYWORDS if c not in merged]
                         except Exception:
                             logger.exception("폐점서류 압축/저장 중 오류")
                             saved = False
                         # 성공/실패/서류 부족 여부를 항상 알려드림(예전엔 성공했을 때만 알려드려서,
                         # 저장이 안 됐을 때 유진님이 알 방법이 없었음 — 유진님 피드백으로 추가).
-                        if saved:
+                        if saved and not missing:
                             await _send_message_retrying(
                                 context.bot, ALLOWED_USER_ID,
                                 f"💾 '{zip_name}' 로 폐점서류를 구글 드라이브에 저장했어요.",
                             )
-                        elif missing is not None:
+                        elif saved and missing:
+                            n = 4 - len(missing)
                             await _send_message_retrying(
                                 context.bot, ALLOWED_USER_ID,
-                                f"⚠️ '{store_name}' 폐점 처리는 됐는데, 이 메일 첨부파일만으로는 "
-                                f"폐점필수서류가 다 안 갖춰져서 구글 드라이브에는 저장하지 못했어요. "
-                                f"(부족한 서류: {', '.join(missing)}) 나머지 서류를 받으시면 봇에 파일로 "
-                                "그냥 올려주세요. 자동으로 나머지랑 합쳐서 저장해드려요.",
+                                f"💾 '{store_name}' 폐점서류를 일부 저장했어요 ({n}/4, '{zip_name}'). "
+                                f"부족한 서류: {', '.join(missing)}. 나머지 서류를 받으시면 봇에 파일로 "
+                                "그냥 올려주세요. 자동으로 이어서 채워드려요.",
+                            )
+                        elif missing:
+                            await _send_message_retrying(
+                                context.bot, ALLOWED_USER_ID,
+                                f"⚠️ '{store_name}' 폐점 처리는 됐는데, 폐점필수서류도 다 안 갖춰졌고 "
+                                f"(부족한 서류: {', '.join(missing)}) 구글 드라이브 저장에도 실패했어요. "
+                                "드라이브 연결 설정을 확인해주세요.",
                             )
                         else:
                             await _send_message_retrying(
