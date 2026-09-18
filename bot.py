@@ -3588,6 +3588,7 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                 # 4종류가 다 안 갖춰진 매장은 조용히 건너뜀(유진님이 정해주신 기준).
                 closed_stores = result.get("closed_stores") or []
                 if closed_stores:
+                  try:
                     other_attachments = _extract_non_xlsx_attachments(msg)
                     brand = result.get("brand")
                     # 메일에 폐점매장이 하나뿐일 때만, 매장명이 파일명에 없는 서류(예: 개인정보
@@ -3597,6 +3598,16 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                         store_name = (closed_store.get("store_name") or "").strip()
                         owner_name = (closed_store.get("owner_name") or "").strip()
                         if not store_name:
+                            # 통합파일엔 폐점 처리가 됐지만 매장명을 못 읽어서 서류 자동 저장을
+                            # 할 수 없는 경우. 예전엔 조용히 건너뛰어서 유진님이 모르고 넘어갈 수
+                            # 있었음 - 이제는 반드시 알려드림.
+                            await context.bot.send_message(
+                                chat_id=ALLOWED_USER_ID,
+                                text=(
+                                    "⚠️ 폐점 매장이 처리됐는데 매장명을 확인하지 못해서 "
+                                    "폐점서류 자동 저장은 건너뛰었어요. 통합파일에서 직접 확인 부탁드려요."
+                                ),
+                            )
                             continue
                         zip_name = _closure_zip_name(store_name, owner_name)
                         saved = False
@@ -3651,6 +3662,15 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                                     "드라이브 연결 설정(GDRIVE_OAUTH_* / GDRIVE_FOLDER_ID)을 확인해주세요."
                                 ),
                             )
+                  except Exception:
+                    # 위 블록 어디서든(첨부파일 목록 추출 등, 개별 try로 못 막는 부분 포함)
+                    # 예상 못 한 예외가 나면 예전엔 여기서 그냥 조용히 끝나서 유진님이 폐점서류
+                    # 저장 여부를 전혀 알 수 없었음 - 반드시 실패 알림이 가도록 함.
+                    logger.exception("폐점서류 처리 준비 중 오류")
+                    await context.bot.send_message(
+                        chat_id=ALLOWED_USER_ID,
+                        text="❌ 폐점서류 처리 중 예상치 못한 오류가 발생해서 구글 드라이브에 저장하지 못했어요. 직접 확인 부탁드려요.",
+                    )
 
         last_uid_seen = latest_uid
         imap.logout()
