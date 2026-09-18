@@ -2364,16 +2364,19 @@ async def _sync_and_notify(
             f"\n❌ 구글 드라이브 저장 실패: {', '.join(drive_failed_stores)} "
             "(드라이브 연결 설정을 확인해주세요. 텔레그램으로는 정상적으로 받으셨을 거예요)"
         )
-    await bot.send_message(chat_id=chat_id, text=summary)
+    # 이 요약 메시지(신규/폐점 매장 건수 포함) 전송이 타임아웃 등으로 실패하면, 그 예외가
+    # 이 함수 밖(check_new_mail의 try/except)까지 새어나가 return result에 도달하지 못하고
+    # 결과가 통째로 유실됨 -> 호출한 쪽의 폐점서류 저장 로직까지 같이 건너뛰게 되는 사고로
+    # 이어졌음(2026-09-18, 세정 폐점 건). 이후로는 이 함수의 나머지 전송은 전부 재시도 래퍼를
+    # 쓰고, 실패해도 예외를 던지지 않아 반드시 아래 return result까지 도달하도록 함.
+    await _send_message_retrying(bot, chat_id, summary)
 
     if no_contact_stores:
         names = ", ".join(sorted(set(no_contact_stores)))
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"ℹ️ {names} 담당자 이메일이 등록되어 있지 않아 자동 발송을 못 했어요.\n"
-                "/setcontact <담당자 이름> <이메일> 로 등록해주시면 다음부터 자동으로 보내드려요."
-            ),
+        await _send_message_retrying(
+            bot, chat_id,
+            f"ℹ️ {names} 담당자 이메일이 등록되어 있지 않아 자동 발송을 못 했어요.\n"
+            "/setcontact <담당자 이름> <이메일> 로 등록해주시면 다음부터 자동으로 보내드려요.",
         )
 
     # 담당자가 보낸 파일에 전체 이력이 섞여 있어서, 접수일자가 아주 오래된(지난 정산기간보다도
@@ -2386,23 +2389,28 @@ async def _sync_and_notify(
             f"- {s['store_name']}({s['store_code']}) 접수일자 {s['stale_recv_date']}"
             for s in stale_stores
         )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⚠️ 아래 매장은 접수일자가 지난 정산기간보다도 오래돼서, 이미 예전에 처리됐는데 "
-                "파일에만 이력으로 남아있던 건일 수 있어요. 확인해주세요(맞으면 그냥 두시면 되고, "
-                "이미 처리된 거면 알려주시면 통합파일에서 빼드릴게요).\n" + lines
-            ),
+        await _send_message_retrying(
+            bot, chat_id,
+            "⚠️ 아래 매장은 접수일자가 지난 정산기간보다도 오래돼서, 이미 예전에 처리됐는데 "
+            "파일에만 이력으로 남아있던 건일 수 있어요. 확인해주세요(맞으면 그냥 두시면 되고, "
+            "이미 처리된 거면 알려주시면 통합파일에서 빼드릴게요).\n" + lines,
         )
 
     if result.get("master_bytes"):
         display_name = _display_name(brand)
-        await bot.send_document(
-            chat_id=chat_id,
-            document=io.BytesIO(result["master_bytes"]),
-            filename=f"{display_name}.xlsx",
+        # 통합파일(xlsx)은 텍스트 메시지보다 용량이 있어 타임아웃이 특히 잘 나던 지점이라
+        # (2026-09-18 사고 원인으로 확인됨) 재시도 래퍼를 씀. 그래도 실패하면 안내만 하고
+        # (엑셀 자체는 이미 서버에 정상 저장돼 있으므로) 아래 return은 그대로 진행함.
+        doc_ok = await _send_document_retrying(
+            bot, chat_id, result["master_bytes"], f"{display_name}.xlsx",
             caption=f"📎 갱신된 '{display_name}' 통합파일이에요.",
         )
+        if not doc_ok:
+            await _send_message_retrying(
+                bot, chat_id,
+                f"⚠️ 갱신된 '{display_name}' 통합파일을 텔레그램으로 전송하는 데 실패했어요 "
+                "(파일 자체는 정상적으로 저장됐어요). 다시 필요하시면 말씀해주세요.",
+            )
 
     return result
 
@@ -3509,6 +3517,50 @@ def _closure_zip_name(store_name: str, owner_name: str) -> str:
     return f"{store_name}_폐점서류.zip"
 
 
+async def _send_message_retrying(bot, chat_id, text: str, retries: int = 3, **kwargs) -> None:
+    """텔레그램 서버 쪽 일시적 타임아웃(telegram.error.TimedOut) 때문에 중요한 결과 알림
+    (저장 성공/실패 등)이 통째로 유실되는 걸 막기 위한 재시도 래퍼. 실제로 폐점서류 저장
+    자체는 문제없이 끝났는데 그 결과를 알려주는 메시지 전송만 타임아웃 나서, 예외가 바깥
+    try/except까지 새어나가 알림이 아예 안 간 사고가 있었음(2026-09-18) - 이후로 알림
+    전송에는 항상 이 함수를 씀."""
+    delay = 1.0
+    last_err = None
+    for attempt in range(retries):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning("메시지 전송 재시도(%d/%d): %s", attempt + 1, retries, e)
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+    logger.error("메시지 전송 최종 실패: %s", last_err)
+
+
+async def _send_document_retrying(bot, chat_id, file_bytes: bytes, filename: str, retries: int = 3, **kwargs) -> bool:
+    """_send_message_retrying과 같은 이유로 만든 문서 전송용 재시도 래퍼. 통합파일(xlsx)처럼
+    용량이 있는 파일은 텍스트 메시지보다 타임아웃이 더 잘 나서 특히 중요함. 성공하면 True,
+    재시도까지 다 실패하면 False를 반환함(호출한 쪽에서 이 실패 때문에 뒷단 로직 전체가
+    끊기지 않도록 값을 보고 판단할 수 있게)."""
+    delay = 1.0
+    last_err = None
+    for attempt in range(retries):
+        try:
+            await bot.send_document(
+                chat_id=chat_id, document=io.BytesIO(file_bytes), filename=filename, **kwargs
+            )
+            return True
+        except Exception as e:
+            last_err = e
+            logger.warning("문서 전송 재시도(%d/%d): %s", attempt + 1, retries, e)
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+    logger.error("문서 전송 최종 실패: %s", last_err)
+    return False
+
+
 async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
     global last_uid_seen
 
@@ -3601,12 +3653,10 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                             # 통합파일엔 폐점 처리가 됐지만 매장명을 못 읽어서 서류 자동 저장을
                             # 할 수 없는 경우. 예전엔 조용히 건너뛰어서 유진님이 모르고 넘어갈 수
                             # 있었음 - 이제는 반드시 알려드림.
-                            await context.bot.send_message(
-                                chat_id=ALLOWED_USER_ID,
-                                text=(
-                                    "⚠️ 폐점 매장이 처리됐는데 매장명을 확인하지 못해서 "
-                                    "폐점서류 자동 저장은 건너뛰었어요. 통합파일에서 직접 확인 부탁드려요."
-                                ),
+                            await _send_message_retrying(
+                                context.bot, ALLOWED_USER_ID,
+                                "⚠️ 폐점 매장이 처리됐는데 매장명을 확인하지 못해서 "
+                                "폐점서류 자동 저장은 건너뛰었어요. 통합파일에서 직접 확인 부탁드려요.",
                             )
                             continue
                         zip_name = _closure_zip_name(store_name, owner_name)
@@ -3640,36 +3690,32 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                         # 성공/실패/서류 부족 여부를 항상 알려드림(예전엔 성공했을 때만 알려드려서,
                         # 저장이 안 됐을 때 유진님이 알 방법이 없었음 — 유진님 피드백으로 추가).
                         if saved:
-                            await context.bot.send_message(
-                                chat_id=ALLOWED_USER_ID,
-                                text=f"💾 '{zip_name}' 로 폐점서류를 구글 드라이브에 저장했어요.",
+                            await _send_message_retrying(
+                                context.bot, ALLOWED_USER_ID,
+                                f"💾 '{zip_name}' 로 폐점서류를 구글 드라이브에 저장했어요.",
                             )
                         elif missing is not None:
-                            await context.bot.send_message(
-                                chat_id=ALLOWED_USER_ID,
-                                text=(
-                                    f"⚠️ '{store_name}' 폐점 처리는 됐는데, 이 메일 첨부파일만으로는 "
-                                    f"폐점필수서류가 다 안 갖춰져서 구글 드라이브에는 저장하지 못했어요. "
-                                    f"(부족한 서류: {', '.join(missing)}) 나머지 서류를 받으시면 봇에 파일로 "
-                                    "그냥 올려주세요. 자동으로 나머지랑 합쳐서 저장해드려요."
-                                ),
+                            await _send_message_retrying(
+                                context.bot, ALLOWED_USER_ID,
+                                f"⚠️ '{store_name}' 폐점 처리는 됐는데, 이 메일 첨부파일만으로는 "
+                                f"폐점필수서류가 다 안 갖춰져서 구글 드라이브에는 저장하지 못했어요. "
+                                f"(부족한 서류: {', '.join(missing)}) 나머지 서류를 받으시면 봇에 파일로 "
+                                "그냥 올려주세요. 자동으로 나머지랑 합쳐서 저장해드려요.",
                             )
                         else:
-                            await context.bot.send_message(
-                                chat_id=ALLOWED_USER_ID,
-                                text=(
-                                    f"❌ '{zip_name}' 구글 드라이브 저장에 실패했어요. "
-                                    "드라이브 연결 설정(GDRIVE_OAUTH_* / GDRIVE_FOLDER_ID)을 확인해주세요."
-                                ),
+                            await _send_message_retrying(
+                                context.bot, ALLOWED_USER_ID,
+                                f"❌ '{zip_name}' 구글 드라이브 저장에 실패했어요. "
+                                "드라이브 연결 설정(GDRIVE_OAUTH_* / GDRIVE_FOLDER_ID)을 확인해주세요.",
                             )
                   except Exception:
                     # 위 블록 어디서든(첨부파일 목록 추출 등, 개별 try로 못 막는 부분 포함)
                     # 예상 못 한 예외가 나면 예전엔 여기서 그냥 조용히 끝나서 유진님이 폐점서류
                     # 저장 여부를 전혀 알 수 없었음 - 반드시 실패 알림이 가도록 함.
                     logger.exception("폐점서류 처리 준비 중 오류")
-                    await context.bot.send_message(
-                        chat_id=ALLOWED_USER_ID,
-                        text="❌ 폐점서류 처리 중 예상치 못한 오류가 발생해서 구글 드라이브에 저장하지 못했어요. 직접 확인 부탁드려요.",
+                    await _send_message_retrying(
+                        context.bot, ALLOWED_USER_ID,
+                        "❌ 폐점서류 처리 중 예상치 못한 오류가 발생해서 구글 드라이브에 저장하지 못했어요. 직접 확인 부탁드려요.",
                     )
 
         last_uid_seen = latest_uid
