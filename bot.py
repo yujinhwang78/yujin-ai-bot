@@ -2630,14 +2630,16 @@ def _get_gdrive_service():
             client_id=GDRIVE_OAUTH_CLIENT_ID,
             client_secret=GDRIVE_OAUTH_CLIENT_SECRET,
             token_uri="https://oauth2.googleapis.com/token",
-            # 'drive'(전체 접근)는 구글이 '민감한 권한'으로 분류해서 앱을 프로덕션으로
-            # 전환하려면 정식 심사가 필요함 - 개인용 봇엔 비현실적. 'drive.file'(이 앱이
-            # 직접 만든 파일/폴더만 접근)은 '민감하지 않은 권한'이라 심사 없이 프로덕션
-            # 전환이 가능해서, refresh token이 7일마다 끊기는 문제를 근본적으로 없앨 수 있음.
-            # 이 권한으로 바꾸면 이 앱이 새로 만들지 않은 기존 폴더는 더 이상 못 보므로,
-            # GDRIVE_FOLDER_ID를 "root"(내 드라이브 최상위)로 설정해서 앞으로 필요한 폴더를
-            # 전부 이 앱이 새로 만들어 쓰도록 함(2026-09-22 변경).
-            scopes=["https://www.googleapis.com/auth/drive.file"],
+            # 'drive.file'(이 앱이 직접 만든 파일만 접근)로 잠깐 바꿔봤으나, 유진님이 이미
+            # 여러 단계 깊이로 만들어두신 기존 폴더 구조(가입증명서/세정(1112)/25년/...)에는
+            # 이 권한으로 접근이 안 돼서(이 앱이 만들지 않은 폴더라 안 보임) 엉뚱한 곳에 새
+            # 폴더가 생기는 문제가 있었음. 기존 폴더 구조를 그대로 쓰는 게 더 중요하므로
+            # 'drive'(전체 접근)로 되돌림(2026-09-22).
+            # scopes는 일부러 지정하지 않음: refresh token 자체에 이미 발급 당시의 권한
+            # 범위가 저장돼 있어서, refresh 요청에 scopes를 같이 넘기면 구글 서버가 이를
+            # "다시 검증해야 할 요청"으로 보고 invalid_scope로 거부하는 경우가 있었음
+            # (실제로 새로 발급받은 refresh token으로도 계속 invalid_scope가 재현됨,
+            # 2026-09-22). scopes를 안 넘기면 refresh token에 저장된 범위를 그대로 씀.
         )
         creds.refresh(_gdrive_auth_request())
         _gdrive_service = _gdrive_build("drive", "v3", credentials=creds)
