@@ -4,6 +4,7 @@ import re
 import json
 import copy
 import uuid
+import unicodedata
 import base64
 import zipfile
 import asyncio
@@ -1574,6 +1575,60 @@ def _compute_new_store_cert_values(vals: dict, rate1_pct: float, rate2: float) -
     }
 
 
+_PREMIUM_MISMATCH_TOLERANCE = 1  # 반올림 오차 정도는 무시(원 단위)
+
+
+def _to_number(v) -> float | None:
+    """엑셀 칸 값을 숫자로 바꿈(문자/공백/None이면 None). 수식 칸을 data_only로 읽었을 때
+    이미 계산된 숫자가 들어있는 걸 전제로 함."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _verify_new_store_premium(vals: dict, cert_vals: dict) -> dict | None:
+    """신규매장 정산양식의 '잔여 합계보험료' 칸(담당자가 보낸 파일에 이미 계산되어 있는 값)이
+    봇이 직접 계산한 값(=(연간재물보험료+연간영업배상보험료)*보험기간일수/365, 가입증명서에도
+    쓰는 그 값)과 같은지 확인함. 그 칸이 비어있으면(서식에 없거나 계산 전) None을 반환하고
+    조용히 넘어감 - 있을 때만 비교함."""
+    stated = _to_number(vals.get("잔여합계보험료"))
+    if stated is None:
+        return None
+    expected = cert_vals.get("premium")
+    if expected is None:
+        return None
+    if abs(stated - expected) <= _PREMIUM_MISMATCH_TOLERANCE:
+        return None
+    return {"store_name": str(vals.get("매장명") or "").strip(), "expected": expected, "stated": round(stated)}
+
+
+def _verify_closed_store_refund(vals: dict) -> dict | None:
+    """폐점매장 정산양식의 '환급보험료' 칸이, 같은 행의 '연간총보험료'/'폐점일'/'보험시작일'
+    값으로 직접 계산한 값(=연간총보험료-연간총보험료*DATEDIF(보험시작일,폐점일,"d")/365 -
+    유진님 정산양식 서식에 실제로 들어있는 수식 그대로)과 같은지 확인함. 필요한 값 중 하나라도
+    없으면(서식이 다르거나 계산 전) None을 반환하고 조용히 넘어감."""
+    annual_premium = _to_number(vals.get("연간총보험료"))
+    refund_stated = _to_number(vals.get("환급보험료"))
+    start = vals.get("보험시작일")
+    closed = vals.get("폐점일")
+    if annual_premium is None or refund_stated is None:
+        return None
+    if not (hasattr(start, "date") and hasattr(closed, "date")):
+        return None
+    used_days = (closed - start).days
+    expected = annual_premium - annual_premium * used_days / 365
+    if abs(refund_stated - expected) <= _PREMIUM_MISMATCH_TOLERANCE:
+        return None
+    return {
+        "store_name": str(vals.get("매장명") or "").strip(),
+        "expected": round(expected),
+        "stated": round(refund_stated),
+    }
+
+
 def _load_policy_numbers() -> dict:
     try:
         with open(POLICY_NUMBERS_FILE, "r", encoding="utf-8") as f:
@@ -2026,6 +2081,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     new_stores = []
     closed_count = 0
     closed_stores = []
+    premium_mismatches = []
 
     input_new_sheets = _find_type_sheets(input_wb, "신규매장")
     master_new_sheets = _find_type_sheets(master_wb, "신규매장")
@@ -2102,6 +2158,9 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             _fill_row_by_period(master_ws, master_header, target_row, vals.get("접수일자"), period_start, period_end)
 
             cert_vals = _compute_new_store_cert_values(vals, rate1, rate2)
+            mismatch = _verify_new_store_premium(vals, cert_vals)
+            if mismatch:
+                premium_mismatches.append({**mismatch, "kind": "신규(잔여 합계보험료)"})
             address = str(vals.get("매장주소") or "").strip()
             # 엑셀 매장주소가 "...52\n(백화점내)"처럼 줄바꿈으로 나뉘어 있는 경우가 있는데,
             # 그대로 두면 가입증명서에 한 줄만 그려서 괄호 부분이 아예 안 보이게 됨(PDF 렌더링이
@@ -2165,6 +2224,9 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             _write_row(master_ws, master_header, target_row, vals, template_row)
             _fill_row_by_period(master_ws, master_header, target_row, vals.get("접수일자"), period_start, period_end)
             closed_count += 1
+            refund_mismatch = _verify_closed_store_refund(vals)
+            if refund_mismatch:
+                premium_mismatches.append({**refund_mismatch, "kind": "폐점(환급보험료)"})
             # 이 행이 통합파일의 '폐점매장' 시트에 그대로 저장되므로(_write_row), 이 매장이
             # '신규매장'으로 기록된 적이 없어도 나중에 _all_closed_store_rows()로 브랜드/
             # 대표자명을 다시 찾을 수 있음(별도 저장소 없이 통합파일 자체가 정보 출처).
@@ -2227,6 +2289,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         "has_policy_no": bool(policy_no),
         "has_cert_template": _has_cert_template(brand),
         "skipped_placeholder_stores": skipped_placeholder_stores,
+        "premium_mismatches": premium_mismatches,
     }
 
 
@@ -2429,6 +2492,23 @@ async def _sync_and_notify(
     # 이어졌음(2026-09-18, 세정 폐점 건). 이후로는 이 함수의 나머지 전송은 전부 재시도 래퍼를
     # 쓰고, 실패해도 예외를 던지지 않아 반드시 아래 return result까지 도달하도록 함.
     await _send_message_retrying(bot, chat_id, summary)
+
+    # 산출보험료 검증(2026-09-29 유진님 요청): 신규매장 '잔여 합계보험료', 폐점매장
+    # '환급보험료'가 봇이 같은 행 값으로 직접 계산한 결과와 다르면 알려드림. 맞을 때는
+    # 조용히 그대로 기재만 하고 따로 알리지 않음(정확하면 알림 없음, 틀릴 때만 알림).
+    premium_mismatches = result.get("premium_mismatches") or []
+    if premium_mismatches:
+        lines = "\n".join(
+            f"- [{m['kind']}] {m['store_name']}: 파일엔 {m['stated']:,}원, 봇 계산으론 {m['expected']:,}원"
+            for m in premium_mismatches
+        )
+        await _send_message_retrying(
+            bot, chat_id,
+            "⚠️ 아래 매장은 정산양식에 적힌 보험료가 봇이 같은 행 값(재물/영업배상 항목, "
+            "보험기간, 연간총보험료 등)으로 직접 계산한 값과 달라요. 통합파일 쪽 칸은 수식이라 "
+            "자동으로 봇 계산값과 같게 나올 거예요 - 정산양식 원본 쪽 숫자나 입력값이 잘못됐을 "
+            "수 있으니 확인해주세요.\n" + lines,
+        )
 
     if no_contact_stores:
         names = ", ".join(sorted(set(no_contact_stores)))
@@ -2802,9 +2882,21 @@ _XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sh
 def _gdrive_find_brand_master_folder(service, brand: str) -> str | None:
     """GDRIVE_FOLDER_ID(가입증명서및정산) 밑에서 유진님이 이미 만들어두신 '정산_{brand}'
     폴더(예: '정산_올리비아로렌')를 찾아 id를 반환함. 없으면 None(새로 만들지 않음 - 유진님이
-    실제 쓰시는 폴더 구조가 아닌 곳에 엉뚱하게 새로 만드는 사고를 막기 위함)."""
+    실제 쓰시는 폴더 구조가 아닌 곳에 엉뚱하게 새로 만드는 사고를 막기 위함).
+    다른 브랜드 폴더 매칭(_resolve_drive_target_folder)과 마찬가지로 완전히 똑같은 이름이
+    아니어도(앞뒤 공백, 유니코드 조합 차이 등) 찾을 수 있도록 느슨하게 비교함 - 완전 일치만
+    보면 눈에는 똑같아 보이는데 못 찾는 경우가 있었음(2026-09-29, '트레몰로' 폴더에서 확인됨)."""
     folder_name = f"정산_{brand}"
-    return _gdrive_find_child_folder(service, GDRIVE_FOLDER_ID, lambda name: name == folder_name)
+    target = unicodedata.normalize("NFC", folder_name).strip()
+
+    def _matches(name: str) -> bool:
+        norm = unicodedata.normalize("NFC", name).strip()
+        return norm == target or target in norm or norm in target
+
+    found = _gdrive_find_child_folder(service, GDRIVE_FOLDER_ID, _matches)
+    if found is None:
+        logger.warning("드라이브에서 '%s' 폴더를 못 찾음(GDRIVE_FOLDER_ID 밑 하위 폴더 이름과 비교함)", folder_name)
+    return found
 
 
 def _gdrive_find_latest_master_file(service, folder_id: str) -> dict | None:
