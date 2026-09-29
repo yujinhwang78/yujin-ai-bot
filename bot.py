@@ -194,6 +194,11 @@ POLICY_NUMBERS_FILE = os.path.join(PERSIST_DIR, "policy_numbers.json")
 # 정산양식을 보내는 담당자 이름 -> 이메일 주소. 신규매장 가입증명서를 그 담당자에게
 # 자동으로 이메일로 보내줄 때 씀(엑셀 '접수자' 칸의 이름으로 찾음)
 CONTACTS_FILE = os.path.join(PERSIST_DIR, "contacts.json")
+# 메일 알림에서 무시할 보낸사람 키워드(발신 이메일 주소/이름에 포함되면 매칭) 목록.
+# 듀오링고 등 광고성 메일이 여기 걸리면 '새 메일 도착' 알림 자체를 안 보냄
+# (2026-09-29 유진님 요청). /mutesender, /unmutesender, /mutedsenders 로 관리함.
+MUTED_SENDERS_FILE = os.path.join(PERSIST_DIR, "muted_senders.json")
+_DEFAULT_MUTED_SENDERS = ["duolingo"]
 # 담당자에게 이메일로 보내기 전에 유진님 확인을 거치는 가입증명서들을 보관하는 곳.
 # "보내기"를 누르기 전까지는 실제로 발송되지 않고 여기에 대기함(재배포/재시작해도
 # 안 없어지도록 디스크에 저장).
@@ -1674,6 +1679,86 @@ def _save_contacts(contacts: dict) -> None:
     os.makedirs(os.path.dirname(CONTACTS_FILE), exist_ok=True)
     with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
         json.dump(contacts, f, ensure_ascii=False, indent=2)
+
+
+def _load_muted_senders() -> list:
+    try:
+        with open(MUTED_SENDERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return list(_DEFAULT_MUTED_SENDERS)
+
+
+def _save_muted_senders(keywords: list) -> None:
+    os.makedirs(os.path.dirname(MUTED_SENDERS_FILE), exist_ok=True)
+    with open(MUTED_SENDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(keywords, f, ensure_ascii=False, indent=2)
+
+
+def _is_muted_sender(sender: str, subject: str = "", list_unsubscribe: str = "") -> bool:
+    """보낸사람 표시(이름+이메일 통째로)나 제목에 무시 키워드가 포함되면 True.
+    'List-Unsubscribe' 헤더(광고/구독성 메일에 거의 항상 붙는 헤더)가 있는 것도 광고성으로
+    간주함 - 단, 이미 등록된 정산 담당자 연락처(contacts.json)에서 보낸 메일은 절대 무시하지
+    않음(실수로 중요한 정산 메일을 놓치는 사고를 막기 위함)."""
+    sender_email = (email.utils.parseaddr(sender)[1] or "").lower()
+    contacts = _load_contacts()
+    if sender_email and sender_email in set(contacts.values()):
+        return False
+    haystack = f"{sender} {subject}".lower()
+    keywords = _load_muted_senders()
+    if any(kw.lower() in haystack for kw in keywords if kw):
+        return True
+    if list_unsubscribe:
+        return True
+    return False
+
+
+async def mute_sender_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "사용법: /mutesender <키워드>\n예: /mutesender duolingo\n\n"
+            "보낸사람 이름/이메일이나 제목에 이 키워드가 들어있으면 '새 메일 도착' 알림을 안 보내요."
+        )
+        return
+    keyword = " ".join(context.args).strip()
+    keywords = _load_muted_senders()
+    if keyword.lower() not in [k.lower() for k in keywords]:
+        keywords.append(keyword)
+        _save_muted_senders(keywords)
+    await update.message.reply_text(f"🔕 앞으로 '{keyword}'가 포함된 메일은 알림을 안 보낼게요.")
+
+
+async def unmute_sender_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("사용법: /unmutesender <키워드>\n예: /unmutesender duolingo")
+        return
+    keyword = " ".join(context.args).strip()
+    keywords = _load_muted_senders()
+    new_keywords = [k for k in keywords if k.lower() != keyword.lower()]
+    if len(new_keywords) == len(keywords):
+        await update.message.reply_text(f"'{keyword}'는 무시 목록에 없어요. /mutedsenders 로 확인해주세요.")
+        return
+    _save_muted_senders(new_keywords)
+    await update.message.reply_text(f"🔔 '{keyword}' 무시를 해제했어요.")
+
+
+async def list_muted_senders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    keywords = _load_muted_senders()
+    if not keywords:
+        await update.message.reply_text("무시 중인 보낸사람 키워드가 없어요.")
+        return
+    lines = "\n".join(f"- {k}" for k in keywords)
+    await update.message.reply_text(
+        f"무시 중인 보낸사람/제목 키워드:\n{lines}\n\n"
+        "(이 키워드가 포함된 메일과, 'List-Unsubscribe' 헤더가 붙은 광고성 메일은 알림을 안 보내요. "
+        "단, 등록된 담당자 연락처로 온 메일은 절대 무시 안 해요.)"
+    )
 
 
 def _norm_contact_name(name: str) -> str:
@@ -3993,25 +4078,31 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
             sender = _decode_mime_words(msg.get("From", "(발신자 알 수 없음)"))
             body = _get_email_body(msg)[:2000]
 
-            try:
-                response = client.messages.create(
-                    model=MODEL_NAME,
-                    max_tokens=300,
-                    system="이메일 내용을 한국어로 3줄 이내로 간결하게 요약해줘. 핵심만 전달해.",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": f"보낸사람: {sender}\n제목: {subject}\n본문:\n{body}",
-                        }
-                    ],
-                )
-                summary = response.content[0].text
-            except Exception:
-                logger.exception("메일 요약 중 오류")
-                summary = "(요약 생성 실패)"
+            # 듀오링고 등 광고/구독성 메일은 '새 메일 도착' 알림을 안 보냄(2026-09-29 유진님
+            # 요청). 등록된 정산 담당자 연락처로 온 메일은 절대 무시하지 않음. 알림만 건너뛰고
+            # 첨부파일 처리(정산양식 동기화 등)는 그대로 진행함 - 혹시라도 무시 대상으로
+            # 잘못 걸려도 실제 업무 처리 자체는 놓치지 않도록.
+            muted = _is_muted_sender(sender, subject, msg.get("List-Unsubscribe", ""))
+            if not muted:
+                try:
+                    response = client.messages.create(
+                        model=MODEL_NAME,
+                        max_tokens=300,
+                        system="이메일 내용을 한국어로 3줄 이내로 간결하게 요약해줘. 핵심만 전달해.",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": f"보낸사람: {sender}\n제목: {subject}\n본문:\n{body}",
+                            }
+                        ],
+                    )
+                    summary = response.content[0].text
+                except Exception:
+                    logger.exception("메일 요약 중 오류")
+                    summary = "(요약 생성 실패)"
 
-            text = f"📬 새 메일 도착\n\n보낸사람: {sender}\n제목: {subject}\n\n요약:\n{summary}"
-            await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=text)
+                text = f"📬 새 메일 도착\n\n보낸사람: {sender}\n제목: {subject}\n\n요약:\n{summary}"
+                await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=text)
 
             # 정산양식 엑셀 첨부파일이 있으면 자동으로 브랜드 통합파일과 동기화하고,
             # 새로 만들어진 가입증명서는 이 메일을 보낸 사람에게도 자동으로 보내줌
@@ -4142,6 +4233,9 @@ def main() -> None:
     app.add_handler(CommandHandler("setcerttemplate", set_cert_template_command))
     app.add_handler(CommandHandler("setcontact", set_contact_command))
     app.add_handler(CommandHandler("contacts", list_contacts_command))
+    app.add_handler(CommandHandler("mutesender", mute_sender_command))
+    app.add_handler(CommandHandler("unmutesender", unmute_sender_command))
+    app.add_handler(CommandHandler("mutedsenders", list_muted_senders_command))
     app.add_handler(CommandHandler("pending", list_pending_command))
     app.add_handler(CallbackQueryHandler(handle_cert_confirmation))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
