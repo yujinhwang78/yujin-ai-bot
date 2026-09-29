@@ -1953,12 +1953,16 @@ async def send_master_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     brand = " ".join(context.args)
-    master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
-    if not os.path.exists(master_path):
-        await update.message.reply_text(f"'{brand}' 통합파일을 찾지 못했어요. /brands 로 정확한 브랜드명을 확인해주세요.")
-        return
-    with open(master_path, "rb") as f:
-        master_bytes = f.read()
+    # 통합파일은 이제 서버가 아니라 구글 드라이브('가입증명서및정산/정산_{브랜드}' 폴더)에
+    # 있으므로, 거기서 먼저 찾아보고 없을 때만(연결 문제 등) 예전 서버 백업을 씀.
+    master_bytes, _drive_id, _drive_name = _load_brand_master_from_drive(brand)
+    if master_bytes is None:
+        master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
+        if not os.path.exists(master_path):
+            await update.message.reply_text(f"'{brand}' 통합파일을 찾지 못했어요. /brands 로 정확한 브랜드명을 확인해주세요.")
+            return
+        with open(master_path, "rb") as f:
+            master_bytes = f.read()
     display_name = _display_name(brand)
     await update.message.reply_document(
         document=io.BytesIO(master_bytes),
@@ -1982,19 +1986,34 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         return None
     brand = _resolve_brand_alias(brand)
 
-    os.makedirs(MASTERS_DIR, exist_ok=True)
-    master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
+    # 통합파일은 이제 서버에 따로 보관하지 않고, 유진님이 실제로 쓰시는 구글 드라이브의
+    # '가입증명서및정산/정산_{브랜드}' 폴더 안 취합본 엑셀을 직접 찾아서 그 자리에서 갱신함
+    # (2026-09-29, 유진님 요청 - 더 이상 텔레그램으로 통합파일을 따로 안 보내고, PC에 자동
+    # 동기화되는 그 파일에 바로 반영해달라고 하심).
+    drive_bytes, drive_file_id, drive_file_name = _load_brand_master_from_drive(brand)
+    drive_master_missing = drive_bytes is None
 
-    if not os.path.exists(master_path):
-        with open(master_path, "wb") as f:
-            f.write(file_bytes)
-        return {"brand": brand, "cold_start": True, "new_stores": [], "closed_count": 0, "master_bytes": file_bytes}
-
-    # 쓰기용(수식 보존)과 읽기용(중복 확인은 계산된 값 기준) 두 벌로 마스터 파일을 엶.
-    # 폐점매장 시트처럼 '매장명' 칸 자체가 VLOOKUP 수식인 행이 실제로 존재하기 때문에,
-    # 중복 판별은 반드시 계산된 값(data_only=True) 기준으로 해야 정확함.
-    master_wb = openpyxl.load_workbook(master_path, data_only=False)
-    master_wb_values = openpyxl.load_workbook(master_path, data_only=True)
+    if drive_master_missing:
+        # 드라이브에서 '정산_{brand}' 폴더나 그 안의 취합본 엑셀을 못 찾음(폴더가 아직
+        # 없거나, 드라이브 연결 자체에 문제가 있을 수 있음) - 데이터 유실을 막기 위해
+        # 예전처럼 서버에 임시로 보관해두고, 안내 메시지로 확인을 요청함.
+        os.makedirs(MASTERS_DIR, exist_ok=True)
+        master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
+        if not os.path.exists(master_path):
+            with open(master_path, "wb") as f:
+                f.write(file_bytes)
+            return {
+                "brand": brand, "cold_start": True, "new_stores": [], "closed_count": 0,
+                "master_bytes": file_bytes, "drive_master_missing": True,
+            }
+        # 쓰기용(수식 보존)과 읽기용(중복 확인은 계산된 값 기준) 두 벌로 마스터 파일을 엶.
+        # 폐점매장 시트처럼 '매장명' 칸 자체가 VLOOKUP 수식인 행이 실제로 존재하기 때문에,
+        # 중복 판별은 반드시 계산된 값(data_only=True) 기준으로 해야 정확함.
+        master_wb = openpyxl.load_workbook(master_path, data_only=False)
+        master_wb_values = openpyxl.load_workbook(master_path, data_only=True)
+    else:
+        master_wb = openpyxl.load_workbook(io.BytesIO(drive_bytes), data_only=False)
+        master_wb_values = openpyxl.load_workbook(io.BytesIO(drive_bytes), data_only=True)
 
     policy_numbers = _load_policy_numbers()
     policy_no = policy_numbers.get(brand, "")
@@ -2180,8 +2199,18 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     out = io.BytesIO()
     master_wb.save(out)
     master_bytes = out.getvalue()
-    with open(master_path, "wb") as f:
-        f.write(master_bytes)
+
+    if drive_master_missing:
+        with open(master_path, "wb") as f:
+            f.write(master_bytes)
+        master_saved_to_drive = False
+    else:
+        master_saved_to_drive = _save_brand_master_to_drive(drive_file_id, master_bytes)
+        if not master_saved_to_drive:
+            # 드라이브 저장이 실패하면(연결 끊김 등) 유실 방지용으로 서버에도 백업해둠
+            os.makedirs(MASTERS_DIR, exist_ok=True)
+            with open(os.path.join(MASTERS_DIR, f"{brand}.xlsx"), "wb") as f:
+                f.write(master_bytes)
 
     return {
         "brand": brand,
@@ -2189,7 +2218,12 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         "new_stores": new_stores,
         "closed_count": closed_count,
         "closed_stores": closed_stores,
-        "master_bytes": master_bytes,
+        # 드라이브 저장에 성공했으면 텔레그램으로 따로 파일을 보내지 않으므로 None으로 비워둠
+        # (실패했을 때만 유실 방지용으로 파일 자체를 담아 보냄 - _sync_and_notify에서 처리)
+        "master_bytes": None if master_saved_to_drive else master_bytes,
+        "master_saved_to_drive": master_saved_to_drive,
+        "master_drive_file_name": drive_file_name if not drive_master_missing else None,
+        "drive_master_missing": drive_master_missing,
         "has_policy_no": bool(policy_no),
         "has_cert_template": _has_cert_template(brand),
         "skipped_placeholder_stores": skipped_placeholder_stores,
@@ -2221,10 +2255,20 @@ async def _sync_and_notify(
     brand = result["brand"]
 
     if result["cold_start"]:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"📁 '{brand}' 통합파일을 처음 등록했어요. 앞으로 이 파일을 기준으로 신규/폐점 매장을 비교할게요.",
-        )
+        if result.get("drive_master_missing"):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📁 구글 드라이브에서 '{brand}' 통합파일을 찾지 못해서, 이번 파일을 서버에 임시 기준으로 "
+                    f"등록했어요.\n'가입증명서및정산' 폴더 밑에 '정산_{brand}' 폴더가 있고 그 안에 취합본 "
+                    "엑셀이 있는지 확인해주세요 — 확인되면 다음부터는 그 파일에 바로 반영해드릴게요."
+                ),
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📁 '{brand}' 통합파일을 처음 등록했어요. 앞으로 이 파일을 기준으로 신규/폐점 매장을 비교할게요.",
+            )
         return result
 
     skipped_placeholder_stores = result.get("skipped_placeholder_stores") or []
@@ -2366,6 +2410,19 @@ async def _sync_and_notify(
             f"\n❌ 구글 드라이브 저장 실패: {', '.join(drive_failed_stores)} "
             "(드라이브 연결 설정을 확인해주세요. 텔레그램으로는 정상적으로 받으셨을 거예요)"
         )
+    if result.get("master_saved_to_drive"):
+        master_file_name = result.get("master_drive_file_name")
+        if master_file_name:
+            summary += f"\n💾 드라이브의 '{master_file_name}' 파일에 정산 내용을 바로 반영했어요(PC에도 자동 동기화될 거예요)."
+        else:
+            summary += "\n💾 통합파일도 드라이브의 기존 파일에 바로 반영했어요(PC에도 자동 동기화될 거예요)."
+    elif result.get("drive_master_missing"):
+        summary += (
+            f"\n⚠️ 드라이브에서 '{brand}' 통합파일을 못 찾아서 서버에만 임시로 저장했어요. "
+            f"'가입증명서및정산' 폴더 밑에 '정산_{brand}' 폴더가 있는지 확인해주세요."
+        )
+    elif result.get("master_bytes"):
+        summary += "\n❌ 통합파일을 드라이브에 저장하는 데 실패해서, 대신 파일로 보내드려요(수동으로 반영해주세요)."
     # 이 요약 메시지(신규/폐점 매장 건수 포함) 전송이 타임아웃 등으로 실패하면, 그 예외가
     # 이 함수 밖(check_new_mail의 try/except)까지 새어나가 return result에 도달하지 못하고
     # 결과가 통째로 유실됨 -> 호출한 쪽의 폐점서류 저장 로직까지 같이 건너뛰게 되는 사고로
@@ -2398,20 +2455,20 @@ async def _sync_and_notify(
             "이미 처리된 거면 알려주시면 통합파일에서 빼드릴게요).\n" + lines,
         )
 
+    # master_bytes는 드라이브 저장에 성공했으면 None(더 이상 텔레그램으로 통합파일을 따로
+    # 안 보냄, 2026-09-29 유진님 요청) - 드라이브에서 못 찾았거나 저장이 실패했을 때만
+    # 데이터 유실 방지용으로 파일 자체를 보내둠.
     if result.get("master_bytes"):
         display_name = _display_name(brand)
-        # 통합파일(xlsx)은 텍스트 메시지보다 용량이 있어 타임아웃이 특히 잘 나던 지점이라
-        # (2026-09-18 사고 원인으로 확인됨) 재시도 래퍼를 씀. 그래도 실패하면 안내만 하고
-        # (엑셀 자체는 이미 서버에 정상 저장돼 있으므로) 아래 return은 그대로 진행함.
         doc_ok = await _send_document_retrying(
             bot, chat_id, result["master_bytes"], f"{display_name}.xlsx",
-            caption=f"📎 갱신된 '{display_name}' 통합파일이에요.",
+            caption=f"📎 '{display_name}' 통합파일이에요(드라이브에 반영을 못 해서 대신 보내드려요 - 확인 후 수동으로 반영해주세요).",
         )
         if not doc_ok:
             await _send_message_retrying(
                 bot, chat_id,
-                f"⚠️ 갱신된 '{display_name}' 통합파일을 텔레그램으로 전송하는 데 실패했어요 "
-                "(파일 자체는 정상적으로 저장됐어요). 다시 필요하시면 말씀해주세요.",
+                f"⚠️ '{display_name}' 통합파일을 텔레그램으로 전송하는 데도 실패했어요 "
+                "(파일 자체는 서버에 임시로 저장돼 있어요). 다시 필요하시면 말씀해주세요.",
             )
 
     return result
@@ -2737,6 +2794,68 @@ def _resolve_drive_target_folder(service, brand: str, extra_subfolder: str | Non
     if sub_folder_id is None:
         sub_folder_id = _gdrive_create_folder(service, brand_folder_id, extra_subfolder)
     return sub_folder_id
+
+
+_XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _gdrive_find_brand_master_folder(service, brand: str) -> str | None:
+    """GDRIVE_FOLDER_ID(가입증명서및정산) 밑에서 유진님이 이미 만들어두신 '정산_{brand}'
+    폴더(예: '정산_올리비아로렌')를 찾아 id를 반환함. 없으면 None(새로 만들지 않음 - 유진님이
+    실제 쓰시는 폴더 구조가 아닌 곳에 엉뚱하게 새로 만드는 사고를 막기 위함)."""
+    folder_name = f"정산_{brand}"
+    return _gdrive_find_child_folder(service, GDRIVE_FOLDER_ID, lambda name: name == folder_name)
+
+
+def _gdrive_find_latest_master_file(service, folder_id: str) -> dict | None:
+    """그 폴더 안의 엑셀 파일들 중, 열려있을 때 생기는 임시 잠금 파일('~$'로 시작)은 제외하고
+    가장 최근에 수정된 파일 하나를 {"id","name"}로 반환. 유진님이 파일명을 그때그때 바꿔가며
+    (예: '..._260918.xlsx') 쓰시므로 이름이 아니라 수정 시각 기준으로 '현재 쓰는 파일'을 고름."""
+    query = f"'{folder_id}' in parents and trashed=false and mimeType='{_XLSX_MIMETYPE}'"
+    resp = service.files().list(
+        q=query, fields="files(id,name,modifiedTime)", orderBy="modifiedTime desc", pageSize=50
+    ).execute()
+    for f in resp.get("files", []):
+        if not f["name"].startswith("~$"):
+            return f
+    return None
+
+
+def _load_brand_master_from_drive(brand: str) -> tuple[bytes | None, str | None, str | None]:
+    """브랜드의 '정산_{brand}' 드라이브 폴더에서 현재 쓰는 통합파일을 찾아 내용을 내려받음.
+    반환: (파일 내용 bytes, 드라이브 file id, 파일명). 못 찾으면 (None, None, None)."""
+    service = _get_gdrive_service()
+    if service is None:
+        return None, None, None
+    try:
+        folder_id = _gdrive_find_brand_master_folder(service, brand)
+        if folder_id is None:
+            return None, None, None
+        f = _gdrive_find_latest_master_file(service, folder_id)
+        if f is None:
+            return None, None, None
+        content = _gdrive_download_file(service, f["id"])
+        if content is None:
+            return None, None, None
+        return content, f["id"], f["name"]
+    except Exception:
+        logger.exception("드라이브에서 '%s' 통합파일을 찾는 중 오류", brand)
+        return None, None, None
+
+
+def _save_brand_master_to_drive(file_id: str, file_bytes: bytes) -> bool:
+    """찾아둔 그 파일(file_id)을 그대로 덮어써서 저장함(새 파일을 만들지 않음 - 유진님 PC의
+    구글 드라이브 동기화 폴더에 있는 바로 그 파일이 갱신되게 하기 위함)."""
+    service = _get_gdrive_service()
+    if service is None:
+        return False
+    try:
+        media = _gdrive_media(file_bytes, mimetype=_XLSX_MIMETYPE)
+        service.files().update(fileId=file_id, media_body=media).execute()
+        return True
+    except Exception:
+        logger.exception("통합파일을 드라이브에 저장하는 중 오류")
+        return False
 
 
 def _upload_to_drive(
