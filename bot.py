@@ -9,6 +9,7 @@ import base64
 import zipfile
 import asyncio
 import datetime as dt
+from zoneinfo import ZoneInfo
 import logging
 import imaplib
 import smtplib
@@ -3874,6 +3875,86 @@ async def _send_document_retrying(bot, chat_id, file_bytes: bytes, filename: str
     return False
 
 
+KST = ZoneInfo("Asia/Seoul")
+
+# 구글 드라이브 refresh token이 구글 앱 '테스트' 상태라 발급 후 약 7일이면 만료되므로, 6일
+# 주기로 미리 갱신 안내를 드림(2026-09-22 결정). 그 6일째가 주말/공휴일이면 다음 영업일에
+# 알려달라고 하셔서(2026-09-29), 아래 공휴일 목록 기준으로 평일까지 미뤄서 계산함.
+# 주의: 이 목록은 2026년 기준. 해가 바뀌면 그 해의 대한민국 법정공휴일로 갱신해야 함
+# (갱신 안 해도 주말 제외 로직은 계속 동작하므로 최악의 경우 공휴일에 알림이 가는 정도의
+# 문제만 생김 - 완전히 멈추진 않음).
+_KR_HOLIDAYS_2026 = {
+    dt.date(2026, 1, 1),   # 신정
+    dt.date(2026, 2, 16),  # 설날 연휴
+    dt.date(2026, 2, 17),  # 설날
+    dt.date(2026, 2, 18),  # 설날 연휴
+    dt.date(2026, 3, 2),   # 삼일절 대체공휴일
+    dt.date(2026, 5, 5),   # 어린이날
+    dt.date(2026, 5, 25),  # 부처님오신날 대체공휴일
+    dt.date(2026, 6, 6),   # 현충일
+    dt.date(2026, 8, 17),  # 광복절 대체공휴일
+    dt.date(2026, 9, 24),  # 추석 연휴
+    dt.date(2026, 9, 25),  # 추석
+    dt.date(2026, 9, 26),  # 추석 연휴
+    dt.date(2026, 10, 5),  # 개천절 대체공휴일
+    dt.date(2026, 10, 9),  # 한글날
+    dt.date(2026, 12, 25),  # 크리스마스
+}
+
+
+def _is_kr_business_day(d: dt.date) -> bool:
+    if d.weekday() >= 5:  # 토(5)/일(6)
+        return False
+    if d.year == 2026 and d in _KR_HOLIDAYS_2026:
+        return False
+    return True
+
+
+def _should_send_token_reminder(today: dt.date) -> bool:
+    """오늘이 '6일 주기 기준일(1/6/11/16/21/26일, 주말·공휴일이면 다음 영업일로 미룸)'과
+    같은 날인지 판단함."""
+    candidates = [d for d in (1, 6, 11, 16, 21, 26) if d <= today.day]
+    anchor_day = max(candidates) if candidates else 26
+    try:
+        target = today.replace(day=anchor_day)
+    except ValueError:
+        return False
+    while not _is_kr_business_day(target):
+        target += dt.timedelta(days=1)
+    return target == today
+
+
+async def check_token_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """구글 드라이브 refresh token을 슬슬 갱신할 때가 되면(6일 주기, 주말/공휴일이면 다음
+    영업일) 유진님께 텔레그램으로 직접 안내함(2026-09-29, 유진님 요청 - 이 세션이 아니라
+    봇 자체가 보내도록)."""
+    if not ALLOWED_USER_ID:
+        return
+    today = dt.datetime.now(KST).date()
+    if not _should_send_token_reminder(today):
+        return
+    text = (
+        "🔑 슬슬 구글 드라이브 토큰을 갱신할 때예요.\n\n"
+        "1. myaccount.google.com/permissions 접속(bubal5503@gmail.com으로 로그인) → "
+        "검색창에 '김대리' 검색 → 나오면 눌러서 '액세스 권한 삭제' (검색해도 안 나오면 "
+        "이미 연결이 끊긴 상태이니 이 단계는 건너뛰어도 돼요)\n"
+        "2. developers.google.com/oauthplayground 접속\n"
+        "3. 오른쪽 위 톱니바퀴 → 'OAuth 2.0 구성'에서 '내 자체 OAuth 자격증명 사용' 체크, "
+        "Client ID/Secret 입력돼 있는지, '강제 프롬프트'가 '동의 화면'인지 확인\n"
+        "4. 왼쪽 '1단계' scope 입력창에 정확히 https://www.googleapis.com/auth/drive 만 "
+        "입력 → 'API 권한 부여' 클릭 → bubal5503@gmail.com으로 로그인 및 동의\n"
+        "5. '2단계'에서 '인증 코드를 토큰으로 교환하기' 클릭\n"
+        "6. 오른쪽 응답 패널에서 \"scope\": \"https://www.googleapis.com/auth/drive\"(.file "
+        "아님)와 refresh_token 값이 있는지 확인\n"
+        "7. Render 대시보드 → yujin-ai-bot 서비스 → Environment 탭 → "
+        "GDRIVE_OAUTH_REFRESH_TOKEN 값 입력칸 클릭 → Ctrl+A → Delete → Playground의 "
+        "'리프레시 토큰' 칸에서 직접 복사(옮겨 적지 말고 꼭 복사/붙여넣기로)한 새 값을 붙여넣기\n"
+        "8. Save Changes → 자동 재배포 대기(2~3분) → 완료되면 정산파일이나 가입증명서 "
+        "하나로 실제 테스트"
+    )
+    await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
+
+
 async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
     global last_uid_seen
 
@@ -4075,6 +4156,9 @@ def main() -> None:
         logger.info("이메일 확인 작업이 등록되었습니다 (%d초 간격).", MAIL_CHECK_INTERVAL)
     else:
         logger.info("GMAIL_ADDRESS/GMAIL_APP_PASSWORD가 없어 이메일 확인 기능은 꺼져 있습니다.")
+
+    app.job_queue.run_daily(check_token_reminder, time=dt.time(hour=8, minute=30, tzinfo=KST))
+    logger.info("구글 드라이브 토큰 갱신 알림 작업이 등록되었습니다(매일 08:30 KST에 확인).")
 
     logger.info("봇을 시작합니다...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
