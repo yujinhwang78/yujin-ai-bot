@@ -2546,32 +2546,38 @@ async def _sync_and_notify(
             ),
         )
 
-    summary = f"✅ '{brand}' 통합파일을 갱신했어요.\n신규 매장 {len(result['new_stores'])}곳"
+    # 아래 "통합파일" 관련 줄은 전부 같은 동작(드라이브 파일에 직접 반영) 하나를 설명하는 거라,
+    # "갱신했어요"처럼 모호한 표현과 "드라이브에 반영했어요"를 따로따로 두 번 말해서 마치 별개
+    # 단계가 두 번 있는 것처럼 보이지 않도록, 결과를 한 줄로 명확하게 합침(2026-10-02, 유진님
+    # 지적 반영). 가입증명서 PDF가 드라이브에 저장됐다는 줄도 통합파일과 헷갈리지 않게 문구를
+    # '가입증명서'라고 명시함.
+    summary = f"신규 매장 {len(result['new_stores'])}곳"
     if result["closed_count"]:
         summary += f", 폐점 매장 {result['closed_count']}곳"
+    summary += " 처리했어요."
     if queued_groups:
         queued_lines = "\n".join(f"  - {', '.join(names)} → {addr}" for names, addr in queued_groups)
         summary += f"\n📧 담당자 발송 확인 대기 중(위 버튼 눌러주세요):\n{queued_lines}"
     if drive_saved:
-        summary += f"\n💾 구글 드라이브에도 {drive_saved}건 저장했어요."
+        summary += f"\n💾 가입증명서 PDF도 구글 드라이브에 {drive_saved}건 저장했어요."
     if drive_failed_stores:
         summary += (
-            f"\n❌ 구글 드라이브 저장 실패: {', '.join(drive_failed_stores)} "
+            f"\n❌ 가입증명서 PDF 드라이브 저장 실패: {', '.join(drive_failed_stores)} "
             "(드라이브 연결 설정을 확인해주세요. 텔레그램으로는 정상적으로 받으셨을 거예요)"
         )
     if result.get("master_saved_to_drive"):
         master_file_name = result.get("master_drive_file_name")
         if master_file_name:
-            summary += f"\n💾 드라이브의 '{master_file_name}' 파일에 정산 내용을 바로 반영했어요(PC에도 자동 동기화될 거예요)."
+            summary += f"\n✅ 통합파일: 드라이브의 '{master_file_name}'에 정산 내용을 바로 반영했어요(PC에도 자동 동기화될 거예요)."
         else:
-            summary += "\n💾 통합파일도 드라이브의 기존 파일에 바로 반영했어요(PC에도 자동 동기화될 거예요)."
+            summary += "\n✅ 통합파일: 드라이브의 기존 파일에 바로 반영했어요(PC에도 자동 동기화될 거예요)."
     elif result.get("drive_master_missing"):
         summary += (
-            f"\n⚠️ 드라이브에서 '{brand}' 통합파일을 못 찾아서 서버에만 임시로 저장했어요. "
+            f"\n⚠️ 통합파일: 드라이브에서 '{brand}' 통합파일을 못 찾아서 서버에만 임시로 저장했어요. "
             f"'가입증명서및정산' 폴더 밑에 '정산_{brand}' 폴더가 있는지 확인해주세요."
         )
     elif result.get("master_bytes"):
-        summary += "\n❌ 통합파일을 드라이브에 저장하는 데 실패해서, 대신 파일로 보내드려요(수동으로 반영해주세요)."
+        summary += "\n❌ 통합파일: 드라이브에 저장하는 데 실패해서, 대신 파일로 보내드려요(수동으로 반영해주세요)."
     # 이 요약 메시지(신규/폐점 매장 건수 포함) 전송이 타임아웃 등으로 실패하면, 그 예외가
     # 이 함수 밖(check_new_mail의 try/except)까지 새어나가 return result에 도달하지 못하고
     # 결과가 통째로 유실됨 -> 호출한 쪽의 폐점서류 저장 로직까지 같이 건너뛰게 되는 사고로
