@@ -1026,10 +1026,19 @@ def _is_placeholder_code(code) -> bool:
 
 def _store_identity_key(vals: dict) -> tuple:
     """매장코드가 없어도 같은 매장인지 알아볼 수 있도록, 매장명+사업자번호(없으면 주소)로
-    만드는 보조 식별 키. 공백/줄바꿈 차이는 무시함."""
-    name = re.sub(r"\s+", "", str(vals.get("매장명") or ""))
-    biz_no = re.sub(r"\s+", "", str(vals.get("사업자번호") or ""))
-    addr = re.sub(r"\s+", "", str(vals.get("매장주소") or ""))
+    만드는 보조 식별 키. 공백/줄바꿈 차이는 무시함.
+    유니코드 정규화(NFC)도 꼭 해줘야 함 - 같은 한글이라도 담당자 PC/입력기에 따라 완성형(NFC)과
+    조합형(NFD)으로 다르게 저장될 수 있어서, 눈으로는 완전히 똑같아 보여도 문자열 비교로는
+    다른 값으로 취급돼 중복을 못 잡는 경우가 실제로 있었음(2026-10-02, 월메이드 조치원점 -
+    지난달엔 매장코드 WMD0032로 정상 등록됐는데, 이번 달 파일에 매장명/주소가 똑같아 보이는
+    채 매장코드만 '코드미개설상태'로 다시 들어와서 신규매장으로 중복 등록되고 가입증명서까지
+    다시 만들어짐. 드라이브 폴더명 매칭 때 겪었던 것과 같은 종류의 문제라 같은 방식으로 고침)."""
+    def _norm(s) -> str:
+        s = unicodedata.normalize("NFC", str(s or ""))
+        return re.sub(r"\s+", "", s)
+    name = _norm(vals.get("매장명"))
+    biz_no = _norm(vals.get("사업자번호"))
+    addr = _norm(vals.get("매장주소"))
     return (name, biz_no or addr)
 
 
