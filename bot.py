@@ -258,7 +258,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset - 지금까지의 대화 기억 지우기\n"
         "/setpolicy <브랜드명> <증권번호> - 브랜드별 증권번호 등록 (가입증명서에 사용)\n"
         "/brands - 등록된 브랜드(통합파일) 목록 확인\n"
-        "/resetbrand <브랜드명> - 해당 브랜드 통합파일 삭제하고 처음부터 다시 등록\n"
         "/setbrandname <브랜드명> <표시할 이름> - 통합파일을 보내드릴 때 쓸 파일명 변경\n"
         "/sendmaster <브랜드명> - 지금 저장된 통합파일을 새로 올리지 않고 다시 받아보기\n"
         "/setbrandalias <다르게 인식된 이름> <진짜 브랜드명> - 담당자마다 다르게 적는 브랜드명을 하나로 통일\n"
@@ -2062,25 +2061,6 @@ async def list_brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             status += f", 별칭: {', '.join(alias_list)}"
         lines.append(f"- {b} ({status})")
     await update.message.reply_text("📋 등록된 브랜드 목록:\n" + "\n".join(lines))
-
-
-async def reset_brand_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "사용법: /resetbrand <브랜드명>\n예: /resetbrand 월메이드\n\n"
-            "해당 브랜드의 통합파일을 삭제해요. 다음에 그 브랜드 엑셀을 올리면 그 파일을 새 기준으로 다시 등록해요.\n"
-            "정확한 브랜드명은 /brands 로 확인할 수 있어요."
-        )
-        return
-    brand = " ".join(context.args)
-    master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
-    if os.path.exists(master_path):
-        os.remove(master_path)
-        await update.message.reply_text(f"🗑️ '{brand}' 통합파일을 삭제했어요. 다음에 이 브랜드 엑셀을 올리면 그 파일을 새 기준으로 등록할게요.")
-    else:
-        await update.message.reply_text(f"'{brand}' 통합파일을 찾지 못했어요. /brands 로 정확한 브랜드명을 확인해주세요.")
 
 
 async def send_master_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4232,7 +4212,6 @@ def main() -> None:
     app.add_handler(CommandHandler("tohome", commute_to_home))
     app.add_handler(CommandHandler("setpolicy", set_policy_command))
     app.add_handler(CommandHandler("brands", list_brands_command))
-    app.add_handler(CommandHandler("resetbrand", reset_brand_command))
     app.add_handler(CommandHandler("setbrandname", set_brand_name_command))
     app.add_handler(CommandHandler("sendmaster", send_master_command))
     app.add_handler(CommandHandler("setbrandalias", set_brand_alias_command))
