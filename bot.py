@@ -268,6 +268,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/testmail <받는이메일> - 샘플 가입증명서로 메일 발송 테스트 (받는이메일 생략하면 내 메일로)\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n"
         "가입증명서도 'OO점 가입증명서 찾아줘'처럼 편하게 말하면 등록된 매장 중에서 찾아서 다시 보내드려요.\n"
+        "'OO점 담당자한테 보내줘'라고 하면 등록된 담당자 이메일로 보낼지 확인 버튼을 띄워드려요.\n"
         "폐점서류(사업자등록증/신분증/통장사본/개인정보동의서)도 명령어 없이 파일로 그냥 올려주시면, "
         "매장을 자동으로 인식해서 4종류가 다 모였을 때 압축해서 구글 드라이브에 저장해드려요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
@@ -3023,6 +3024,23 @@ def _load_brand_master_from_drive(brand: str) -> tuple[bytes | None, str | None,
         return None, None, None
 
 
+def _list_drive_brand_folders(service) -> dict:
+    """GDRIVE_FOLDER_ID('가입증명서및정산') 밑의 '정산_브랜드명' 폴더를 전부 찾아
+    {브랜드명: 폴더ID} 매핑으로 반환함. 가입증명서 재검색/담당자 재발송처럼 '등록된 모든
+    브랜드의 통합파일'을 뒤져야 하는 기능들이 어떤 브랜드가 있는지 미리 알지 못해도 되게 함."""
+    query = (
+        f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false "
+        "and mimeType='application/vnd.google-apps.folder'"
+    )
+    resp = service.files().list(q=query, fields="files(id,name)", pageSize=200).execute()
+    result = {}
+    for f in resp.get("files", []):
+        name = unicodedata.normalize("NFC", f["name"]).strip()
+        if name.startswith("정산_"):
+            result[name[len("정산_"):]] = f["id"]
+    return result
+
+
 def _save_brand_master_to_drive(file_id: str, file_bytes: bytes) -> bool:
     """찾아둔 그 파일(file_id)을 그대로 덮어써서 저장함(새 파일을 만들지 않음 - 유진님 PC의
     구글 드라이브 동기화 폴더에 있는 바로 그 파일이 갱신되게 하기 위함)."""
@@ -3143,47 +3161,84 @@ async def mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _collect_store_rows_from_workbook(result: dict, brand: str, wb, wb_values, sheet_type: str) -> None:
+    """워크북 하나에서 지정한 종류(예: '신규매장'/'폐점매장') 시트를 뒤져서 result(매장명 ->
+    행 정보 목록)에 누적함. 드라이브에서 읽은 워크북/로컬 백업 워크북 양쪽에서 공용으로 씀."""
+    sheets = _find_type_sheets(wb, sheet_type)
+    sheets_values = _find_type_sheets(wb_values, sheet_type)
+    for sub_type, ws in sheets.items():
+        ws_values = sheets_values.get(sub_type)
+        if ws_values is None:
+            continue
+        header, min_row = _build_header_map(ws)
+        if not header:
+            continue
+        rate1 = _extract_rate(ws, header, "연간재물보험료", r"\*([\d.]+)%", 0.0665, min_row)
+        rate2 = _extract_rate(ws, header, "연간영업배상보험료", r"\*([\d.]+)", 1793, min_row)
+        for vals in _extract_data_rows(ws_values, header, min_row, formula_ws=ws, wb_values=wb_values):
+            name_raw = str(vals.get("매장명") or "")
+            for seg in re.split(r"\n+", name_raw):
+                seg = seg.strip()
+                if not seg:
+                    continue
+                result.setdefault(seg, []).append({
+                    "brand": brand,
+                    "sub_type": sub_type,
+                    "vals": vals,
+                    "rate1": rate1,
+                    "rate2": rate2,
+                })
+
+
 def _all_store_rows_by_sheet_type(sheet_type: str) -> dict:
     """등록된 모든 브랜드의 통합파일에서 지정한 종류(예: '신규매장'/'폐점매장') 시트를 다 뒤져서,
     매장명 -> 그 매장이 있던 행(들) 정보를 모아둠. 통합파일이 유일한 정보 출처가 되도록,
-    신규매장 조회/폐점서류 매칭 둘 다 이 함수 하나로 통일함."""
+    신규매장 조회/폐점서류 매칭 둘 다 이 함수 하나로 통일함.
+    예전엔 서버 로컬(MASTERS_DIR)에 있는 파일만 뒤졌는데, 정산 로직이 드라이브를 기준으로
+    바뀐 뒤(2026-10-02)로는 통합파일이 대부분 드라이브에만 있고 서버엔 없어서, '가입증명서
+    찾아줘' 같은 기능이 최신 매장을 못 찾는 문제가 있었음. 이제 드라이브를 먼저 뒤지고,
+    드라이브에서 못 찾은 브랜드(연결 끊김 등)만 서버 로컬 백업으로 보충함."""
     result: dict[str, list[dict]] = {}
-    if not os.path.isdir(MASTERS_DIR):
-        return result
-    for fname in os.listdir(MASTERS_DIR):
-        if not fname.lower().endswith(".xlsx"):
-            continue
-        brand = fname[:-5]
-        path = os.path.join(MASTERS_DIR, fname)
+    seen_brands = set()
+
+    service = _get_gdrive_service()
+    if service is not None:
         try:
-            wb = openpyxl.load_workbook(path, data_only=False)
-            wb_values = openpyxl.load_workbook(path, data_only=True)
+            brand_folders = _list_drive_brand_folders(service)
         except Exception:
-            continue
-        sheets = _find_type_sheets(wb, sheet_type)
-        sheets_values = _find_type_sheets(wb_values, sheet_type)
-        for sub_type, ws in sheets.items():
-            ws_values = sheets_values.get(sub_type)
-            if ws_values is None:
+            logger.exception("드라이브 브랜드 폴더 목록 조회 중 오류")
+            brand_folders = {}
+        for brand, folder_id in brand_folders.items():
+            try:
+                f = _gdrive_find_latest_master_file(service, folder_id)
+                if f is None:
+                    continue
+                content = _gdrive_download_file(service, f["id"])
+                if content is None:
+                    continue
+                wb = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
+                wb_values = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+            except Exception:
+                logger.exception("드라이브에서 '%s' 통합파일을 읽는 중 오류", brand)
                 continue
-            header, min_row = _build_header_map(ws)
-            if not header:
+            seen_brands.add(brand)
+            _collect_store_rows_from_workbook(result, brand, wb, wb_values, sheet_type)
+
+    if os.path.isdir(MASTERS_DIR):
+        for fname in os.listdir(MASTERS_DIR):
+            if not fname.lower().endswith(".xlsx"):
                 continue
-            rate1 = _extract_rate(ws, header, "연간재물보험료", r"\*([\d.]+)%", 0.0665, min_row)
-            rate2 = _extract_rate(ws, header, "연간영업배상보험료", r"\*([\d.]+)", 1793, min_row)
-            for vals in _extract_data_rows(ws_values, header, min_row, formula_ws=ws, wb_values=wb_values):
-                name_raw = str(vals.get("매장명") or "")
-                for seg in re.split(r"\n+", name_raw):
-                    seg = seg.strip()
-                    if not seg:
-                        continue
-                    result.setdefault(seg, []).append({
-                        "brand": brand,
-                        "sub_type": sub_type,
-                        "vals": vals,
-                        "rate1": rate1,
-                        "rate2": rate2,
-                    })
+            brand = fname[:-5]
+            if brand in seen_brands:
+                continue  # 드라이브에서 이미 찾은 브랜드는 서버에 남아있는 예전 사본을 쓰지 않음
+            path = os.path.join(MASTERS_DIR, fname)
+            try:
+                wb = openpyxl.load_workbook(path, data_only=False)
+                wb_values = openpyxl.load_workbook(path, data_only=True)
+            except Exception:
+                continue
+            _collect_store_rows_from_workbook(result, brand, wb, wb_values, sheet_type)
+
     return result
 
 
@@ -3211,6 +3266,107 @@ def _all_initial_list_store_rows() -> dict:
 
 _CERT_LOOKUP_RE = re.compile(r"가입\s*증명서")
 _CERT_LOOKUP_VERBS = ("찾아", "다시", "재발급", "재전송", "보내줘", "보내주세요", "올려줘", "올려주세요", "보여줘")
+_CERT_SEND_TO_CONTACT_KEYWORDS = ("담당자", "메일로", "이메일로")
+
+
+def _match_registered_store_in_text(user_text: str, store_index: dict):
+    """문장 안에 등록된 매장명이 포함돼 있는지 확인. 여러 매장명이 겹쳐 걸리면(예: '점'으로
+    끝나는 짧은 이름이 긴 이름의 일부인 경우) 가장 긴 이름을 우선함. 같은 이름으로 여러 건
+    등록돼 있으면(갱신/재등록 등) 접수일자가 가장 최근인 걸 고름.
+    (매장명, 선택된 entry) 튜플을 반환하거나, 못 찾으면 (None, None)."""
+    matches = [name for name in store_index if name and name in user_text]
+    if not matches:
+        return None, None
+    matches.sort(key=len, reverse=True)
+    store_name = matches[0]
+    entries = store_index[store_name]
+
+    def _recv_key(entry):
+        return _parse_date_val(entry["vals"].get("접수일자")) or dt.date.min
+
+    entries.sort(key=_recv_key, reverse=True)
+    return store_name, entries[0]
+
+
+def _build_cert_from_registered_entry(chosen: dict) -> tuple[dict, bytes]:
+    """이미 통합파일에 등록된 행(entry) 정보로 가입증명서 PDF를 다시 만듦.
+    (store dict, pdf bytes) 튜플을 반환함."""
+    vals = chosen["vals"]
+    cert_vals = _compute_new_store_cert_values(vals, chosen["rate1"], chosen["rate2"])
+    address = str(vals.get("매장주소") or "").strip()
+    address = re.sub(r"\s*\n\s*", " ", address)
+    address = re.sub(r"(?<=\S)\(", " (", address)
+    policy_numbers = _load_policy_numbers()
+    store = {
+        "policy_no": policy_numbers.get(chosen["brand"]) or DEFAULT_POLICY_NO,
+        "store_code": str(vals.get("매장코드") or "").strip(),
+        "store_name": str(vals.get("매장명") or "").strip(),
+        "address": address,
+        **cert_vals,
+    }
+    pdf_bytes = _build_certificate_pdf(store, chosen["brand"])
+    return store, pdf_bytes
+
+
+async def _handle_cert_send_to_contact_request(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> bool:
+    """'대구방촌점 담당자한테 보내줘'처럼, 이미 통합파일에 등록된 매장의 가입증명서를
+    담당자에게 이메일로 보내달라는 요청을 감지해서 처리함. 정산파일 처리 흐름(_sync_and_notify)
+    때와 똑같이 템플릿 메일을 만들고 '보내기/대기/취소' 버튼으로 확인을 받음 - 원래는 그
+    흐름 중에 자동으로 뜨는 버튼인데, 중간에 텔레그램 타임아웃 등으로 끊겨서 못 받았을 때
+    이 매장만 다시 트리거하는 용도(2026-10-02, 세정 웰메이드 대구방촌점 건).
+    _handle_cert_lookup_request보다 먼저 확인해야 함 - '보내줘'가 양쪽 다 걸리는 verb라서,
+    '담당자'/'메일로' 같은 키워드가 있으면 이쪽을 우선함."""
+    if not _CERT_LOOKUP_RE.search(user_text):
+        return False
+    if not any(k in user_text for k in _CERT_SEND_TO_CONTACT_KEYWORDS):
+        return False
+    if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD):
+        return False  # 메일 발송 자체가 설정 안 돼 있으면, 평소처럼 가입증명서 재전송 처리로 넘어가게 둠
+
+    store_index = _all_registered_store_rows()
+    if not store_index:
+        return False
+    store_name, chosen = _match_registered_store_in_text(user_text, store_index)
+    if chosen is None:
+        return False
+
+    vals = chosen["vals"]
+    brand = chosen["brand"]
+    received_by = str(vals.get("접수자") or "").strip()
+    contacts = _load_contacts()
+    target_email = contacts.get(_norm_contact_name(received_by)) if received_by else None
+    if not target_email:
+        await update.message.reply_text(
+            f"'{store_name}' 담당자({received_by or '이름 미확인'}) 이메일이 등록되어 있지 않아요. "
+            "/setcontact <담당자 이름> <이메일> 로 등록해주시면 보내드릴게요."
+        )
+        return True
+
+    try:
+        store, pdf_bytes = _build_cert_from_registered_entry(chosen)
+    except Exception:
+        logger.exception("담당자 발송용 가입증명서 재생성 중 오류")
+        await update.message.reply_text(f"⚠️ '{store_name}' 가입증명서를 다시 만드는 중 오류가 발생했어요.")
+        return True
+
+    out_name = f"{store['store_code']}_{store['store_name']}_{store['start_date_yymmdd']}.pdf"
+    subject = f"[{brand}] {store['store_name']} 가입증명서"
+    body = _CERT_EMAIL_BODY_TEMPLATE.format(store_name=store["store_name"])
+    cert_id = _queue_pending_certs(
+        [{"store_name": store["store_name"], "out_name": out_name, "pdf_bytes": pdf_bytes}],
+        target_email=target_email, subject=subject, body=body,
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 보내기", callback_data=f"sendcert:{cert_id}"),
+        InlineKeyboardButton("⏸ 대기", callback_data=f"holdcert:{cert_id}"),
+        InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
+    ]])
+    await update.message.reply_text(
+        f"담당자 {received_by or target_email}님에게 '{store['store_name']}' 가입증명서를 보낼까요?\n"
+        "(대기를 누르면 이 메시지는 그대로 남아있으니, 나중에 다시 여기서 보내기를 누르시면 돼요)",
+        reply_markup=keyboard,
+    )
+    return True
 
 
 async def _handle_cert_lookup_request(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> bool:
@@ -3227,37 +3383,13 @@ async def _handle_cert_lookup_request(update: Update, context: ContextTypes.DEFA
     if not store_index:
         return False
 
-    # 문장 안에 등록된 매장명이 포함돼 있는지 확인. 여러 매장명이 겹쳐 걸리면(예: '점'으로
-    # 끝나는 짧은 이름이 긴 이름의 일부인 경우) 가장 긴 이름을 우선함
-    matches = [name for name in store_index if name and name in user_text]
-    if not matches:
+    store_name, chosen = _match_registered_store_in_text(user_text, store_index)
+    if chosen is None:
         return False
-    matches.sort(key=len, reverse=True)
-    store_name = matches[0]
     entries = store_index[store_name]
 
-    # 같은 이름으로 여러 건이 있으면(갱신/재등록 등) 접수일자가 가장 최근인 걸 보내줌
-    def _recv_key(entry):
-        return _parse_date_val(entry["vals"].get("접수일자")) or dt.date.min
-
-    entries.sort(key=_recv_key, reverse=True)
-    chosen = entries[0]
-
     try:
-        vals = chosen["vals"]
-        cert_vals = _compute_new_store_cert_values(vals, chosen["rate1"], chosen["rate2"])
-        address = str(vals.get("매장주소") or "").strip()
-        address = re.sub(r"\s*\n\s*", " ", address)
-        address = re.sub(r"(?<=\S)\(", " (", address)
-        policy_numbers = _load_policy_numbers()
-        store = {
-            "policy_no": policy_numbers.get(chosen["brand"]) or DEFAULT_POLICY_NO,
-            "store_code": str(vals.get("매장코드") or "").strip(),
-            "store_name": str(vals.get("매장명") or "").strip(),
-            "address": address,
-            **cert_vals,
-        }
-        pdf_bytes = _build_certificate_pdf(store, chosen["brand"])
+        store, pdf_bytes = _build_cert_from_registered_entry(chosen)
     except Exception:
         logger.exception("가입증명서 재검색/재생성 중 오류")
         await update.message.reply_text(f"⚠️ '{store_name}' 가입증명서를 다시 만드는 중 오류가 발생했어요.")
@@ -3534,7 +3666,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("메일 발송을 취소했어요.")
             return
 
-    # '계산점 가입증명서 찾아줘'처럼 자연스러운 문장으로 재발급을 요청한 경우 감지해서 처리
+    # '대구방촌점 담당자한테 보내줘'처럼 담당자 발송을 요청한 경우를 먼저 확인하고(둘 다
+    # '보내줘'에 걸리므로 순서가 중요함), 아니면 '계산점 가입증명서 찾아줘'처럼 자연스러운
+    # 문장으로 재발급을 요청한 경우를 감지해서 처리
+    if await _handle_cert_send_to_contact_request(update, context, user_text):
+        return
     if await _handle_cert_lookup_request(update, context, user_text):
         return
 
