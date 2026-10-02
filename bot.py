@@ -2375,7 +2375,7 @@ async def _sync_and_notify(
         result = _sync_brand_excel(file_bytes)
     except Exception:
         logger.exception("엑셀 동기화 중 오류")
-        await bot.send_message(chat_id=chat_id, text="⚠️ 엑셀을 처리하는 중 오류가 발생했어요.")
+        await _send_message_retrying(bot, chat_id, "⚠️ 엑셀을 처리하는 중 오류가 발생했어요.")
         return None
 
     if result is None:
@@ -2383,46 +2383,46 @@ async def _sync_and_notify(
 
     brand = result["brand"]
 
+    # 아래부터는 텔레그램 전송에 전부 재시도 래퍼(_send_message_retrying/_send_document_retrying)를
+    # 씀. 예전엔 raw bot.send_message/send_document를 직접 호출해서, 텔레그램 쪽 일시적
+    # 네트워크 지연(telegram.error.TimedOut/NetworkError) 한 번이면 그 예외가 이 함수를 호출한
+    # check_new_mail의 try/except까지 새어나가 그 뒤 단계(통합파일 저장 결과, 담당자 발송 확인
+    # 버튼)가 통째로 날아가고 유진님껜 아무 알림도 안 가는 사고가 있었음(2026-10-02, 세정
+    # 웰메이드 대구방촌점 건 - Render 로그에서 telegram.error.TimedOut 확인함).
     if result["cold_start"]:
         if result.get("drive_master_missing"):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"📁 구글 드라이브에서 '{brand}' 통합파일을 찾지 못해서, 이번 파일을 서버에 임시 기준으로 "
-                    f"등록했어요.\n'가입증명서및정산' 폴더 밑에 '정산_{brand}' 폴더가 있고 그 안에 취합본 "
-                    "엑셀이 있는지 확인해주세요 — 확인되면 다음부터는 그 파일에 바로 반영해드릴게요."
-                ),
+            await _send_message_retrying(
+                bot, chat_id,
+                f"📁 구글 드라이브에서 '{brand}' 통합파일을 찾지 못해서, 이번 파일을 서버에 임시 기준으로 "
+                f"등록했어요.\n'가입증명서및정산' 폴더 밑에 '정산_{brand}' 폴더가 있고 그 안에 취합본 "
+                "엑셀이 있는지 확인해주세요 — 확인되면 다음부터는 그 파일에 바로 반영해드릴게요.",
             )
         else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"📁 '{brand}' 통합파일을 처음 등록했어요. 앞으로 이 파일을 기준으로 신규/폐점 매장을 비교할게요.",
+            await _send_message_retrying(
+                bot, chat_id,
+                f"📁 '{brand}' 통합파일을 처음 등록했어요. 앞으로 이 파일을 기준으로 신규/폐점 매장을 비교할게요.",
             )
         return result
 
     skipped_placeholder_stores = result.get("skipped_placeholder_stores") or []
     if skipped_placeholder_stores:
         names = ", ".join(s["store_name"] for s in skipped_placeholder_stores)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"ℹ️ {names}: 매장코드가 아직 '미개설(추후전달)' 같은 임시 문구인 채로 다시 들어왔는데, "
-                "매장명/사업자번호가 이미 등록된 매장과 같아서 중복 등록하지 않고 건너뛰었어요."
-            ),
+        await _send_message_retrying(
+            bot, chat_id,
+            f"ℹ️ {names}: 매장코드가 아직 '미개설(추후전달)' 같은 임시 문구인 채로 다시 들어왔는데, "
+            "매장명/사업자번호가 이미 등록된 매장과 같아서 중복 등록하지 않고 건너뛰었어요.",
         )
 
     if not result["new_stores"] and not result["closed_count"]:
-        await bot.send_message(chat_id=chat_id, text=f"'{brand}' 기준으로 새로운 신규/폐점 매장이 없어요.")
+        await _send_message_retrying(bot, chat_id, f"'{brand}' 기준으로 새로운 신규/폐점 매장이 없어요.")
         return result
 
     if not result.get("has_cert_template"):
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ '{brand}'의 가입증명서 서식이 아직 등록되어 있지 않아, 다른 브랜드 서식으로 임시로 만들어요. "
-                "증권번호/계약자 등이 실제와 다를 수 있어요. 이 브랜드로 실제 발급된 예시 인증서를 보내주시면 "
-                "전용 서식으로 등록해드릴게요."
-            ),
+        await _send_message_retrying(
+            bot, chat_id,
+            f"⚠️ '{brand}'의 가입증명서 서식이 아직 등록되어 있지 않아, 다른 브랜드 서식으로 임시로 만들어요. "
+            "증권번호/계약자 등이 실제와 다를 수 있어요. 이 브랜드로 실제 발급된 예시 인증서를 보내주시면 "
+            "전용 서식으로 등록해드릴게요.",
         )
 
     ended_stores = []
@@ -2442,16 +2442,27 @@ async def _sync_and_notify(
             pdf_bytes = _build_certificate_pdf(store, brand)
         except Exception:
             logger.exception("가입증명서 생성 중 오류")
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ '{store['store_name']}' 가입증명서 생성에 실패했어요.")
+            await _send_message_retrying(bot, chat_id, f"⚠️ '{store['store_name']}' 가입증명서 생성에 실패했어요.")
             continue
 
         out_name = f"{store['store_code']}_{store['store_name']}_{store['start_date_yymmdd']}.pdf"
-        await bot.send_document(
-            chat_id=chat_id,
-            document=io.BytesIO(pdf_bytes),
-            filename=out_name,
+        # 예전엔 재시도 없는 bot.send_document를 직접 썼는데, 텔레그램 쪽 일시적
+        # timeout(telegram.error.TimedOut)이 나면 그 예외가 이 함수를 호출한 check_new_mail의
+        # try/except까지 새어나가서, 이미 보낸 증명서 PDF 이후의 모든 단계(통합파일 저장 결과
+        # 요약, 담당자 발송 확인 버튼)가 통째로 날아가고 유진님껜 아무 알림도 안 갔음
+        # (2026-10-02, 세정 웰메이드 대구방촌점 건 - Render 로그에서 telegram.error.TimedOut
+        # 확인함). _send_document_retrying은 최대 3번 재시도하고, 그래도 실패하면 False만
+        # 반환해서 예외가 새어나가지 않고 뒷단 로직이 계속 진행되도록 함.
+        doc_ok = await _send_document_retrying(
+            bot, chat_id, pdf_bytes, out_name,
             caption=f"📄 {store['store_name']} 가입증명서",
         )
+        if not doc_ok:
+            await _send_message_retrying(
+                bot, chat_id,
+                f"⚠️ '{store['store_name']}' 가입증명서 PDF를 텔레그램으로 보내는 데 실패했어요 "
+                "(통합파일/드라이브 반영과 담당자 발송은 계속 진행할게요).",
+            )
 
         # 담당자에게 이메일로 보낼지: 메일로 들어온 건이면 그 발신 주소로, 텔레그램으로
         # 직접 올린 건이면 엑셀 '접수자' 이름으로 등록된 연락처를 찾음. 같은 담당자 앞으로
@@ -2507,23 +2518,19 @@ async def _sync_and_notify(
             InlineKeyboardButton("⏸ 대기", callback_data=f"holdcert:{cert_id}"),
             InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
         ]])
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                confirm_text + "\n"
-                "(대기를 누르면 이 메시지는 그대로 남아있으니, 나중에 다시 여기서 보내기를 누르시면 돼요)"
-            ),
+        await _send_message_retrying(
+            bot, chat_id,
+            confirm_text + "\n"
+            "(대기를 누르면 이 메시지는 그대로 남아있으니, 나중에 다시 여기서 보내기를 누르시면 돼요)",
             reply_markup=keyboard,
         )
 
     if ended_stores:
         lines = "\n".join(f"- {s['store_name']}({s['store_code']}) 종기일 {s['end_date']}" for s in ended_stores)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "ℹ️ 아래 매장은 보험종기일이 이미 지나서 통합파일에는 등록했지만 가입증명서는 만들지 않았어요.\n"
-                + lines
-            ),
+        await _send_message_retrying(
+            bot, chat_id,
+            "ℹ️ 아래 매장은 보험종기일이 이미 지나서 통합파일에는 등록했지만 가입증명서는 만들지 않았어요.\n"
+            + lines,
         )
 
     # 아래 "통합파일" 관련 줄은 전부 같은 동작(드라이브 파일에 직접 반영) 하나를 설명하는 거라,
@@ -4099,7 +4106,18 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                         context.bot, ALLOWED_USER_ID, att_bytes, requester_email=sender_email
                     )
                 except Exception:
+                    # 예전엔 여기서 조용히 continue만 해서, 가입증명서 PDF는 이미 보내진
+                    # 뒤 그 다음 단계(통합파일 저장 결과/담당자 발송 버튼)에서 오류가 나면
+                    # 유진님은 아무 알림도 못 받고 뭐가 잘못됐는지 알 수 없었음(2026-10-02
+                    # 유진님이 '신규매장 저장/메일발송이 안 되는 것 같다'며 지적). 이제는
+                    # 반드시 텔레그램으로 알려드림(Render 로그도 그대로 남겨둠).
                     logger.exception("메일 첨부 엑셀 처리 중 오류")
+                    await _send_message_retrying(
+                        context.bot, ALLOWED_USER_ID,
+                        f"⚠️ 메일 첨부 '{att_filename}' 처리 중 오류가 발생했어요. 가입증명서는 "
+                        "이미 보내드렸을 수 있지만, 통합파일 저장이나 담당자 발송 확인 단계까지 "
+                        "끝났는지는 확인이 안 됐어요. Render 로그를 확인해주세요.",
+                    )
                     continue
                 if result is None:
                     # 정산양식 형식이 아닌 일반 첨부파일일 수 있으니 조용히 넘어감
