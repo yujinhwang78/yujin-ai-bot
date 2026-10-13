@@ -879,6 +879,19 @@ def _render_text_image(text: str, font_size_pt: float):
     return img, img.width / CERT_FONT_SCALE, img.height / CERT_FONT_SCALE, descent / CERT_FONT_SCALE
 
 
+POLICY_END_MMDD = (11, 12)  # ㈜세정 재산종합보험 증권 만기(갱신)일. 증권 보험기간은 11.12 00:01 ~ 11.12 00:01
+
+
+def _cert_end_time(data: dict) -> str:
+    """가입증명서 종기 시각. data에 end_time이 있으면 그대로, 없으면 종기일로 판단."""
+    if data.get("end_time"):
+        return data["end_time"]
+    end_d = _parse_date_val(data.get("end_date"))
+    if end_d and (end_d.month, end_d.day) == POLICY_END_MMDD:
+        return "00:01"
+    return "24:00"
+
+
 def _build_certificate_pdf(data: dict, brand: str) -> bytes:
     """브랜드별 실제 발급 예시 증명서를 원본 서식으로 그대로 쓰고, 매장마다 달라지는 5개 항목만
     흰색으로 덮은 뒤 새로 그려넣음. 증권번호/계약자/보험종목 등 나머지는 서식에 이미 올바르게
@@ -913,6 +926,11 @@ def _build_certificate_pdf(data: dict, brand: str) -> bytes:
     draw_text(122.7, period_bottom - 0.05, data["start_date"])
     cover(254.7, period_top, period_bottom, x1=315)
     draw_text(254.7, period_bottom - 0.05, data["end_date"])
+    # 종기 시각: 브랜드 서식마다 원문 시각이 달라서(월메이드 서식만 '24:00'으로 고정돼 있었음 →
+    # 11/12 만기 건이 24:00으로 발급되는 오류, 2026-10-13 충무상설직영특판점 사례) 서식 값을 쓰지 않고
+    # 항상 덮어씀. 증권 만기일(11/12)에 끝나면 증권과 동일하게 00:01, 그 전에 끝나는 단기 매장은 24:00.
+    cover(320.76, period_top, period_bottom, x1=351)
+    draw_text(320.76, period_bottom - 0.05, _cert_end_time(data))
 
     store_top = rows["store_name"]
     store_bottom = row_bottom(store_top)
