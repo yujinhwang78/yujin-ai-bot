@@ -1482,14 +1482,15 @@ def _parse_date_val(date_val) -> dt.date | None:
     직접 타이핑한 파일은 날짜가 진짜 날짜형이 아니라 문자열로 들어오는 경우가 있음."""
     if date_val is None:
         return None
-    if hasattr(date_val, "date"):
+    if isinstance(date_val, dt.datetime):
         return date_val.date()
     if isinstance(date_val, dt.date):
         return date_val
     s = str(date_val).strip()
     if not s:
         return None
-    for fmt in ("%y.%m.%d", "%Y.%m.%d", "%y-%m-%d", "%Y-%m-%d", "%y/%m/%d", "%Y/%m/%d"):
+    s = s.split(" ")[0]  # '2026-11-12 00:00:00' 처럼 시각이 붙은 문자열
+    for fmt in ("%y.%m.%d", "%Y.%m.%d", "%y-%m-%d", "%Y-%m-%d", "%y/%m/%d", "%Y/%m/%d", "%m/%d/%Y"):
         try:
             return dt.datetime.strptime(s, fmt).date()
         except ValueError:
@@ -1577,14 +1578,10 @@ def _compute_new_store_cert_values(vals: dict, rate1_pct: float, rate2: float) -
     liability_premium = pyeong * rate2
     start = vals.get("보험시작일")
     end = vals.get("보험종기일")
-    if hasattr(start, "date"):
-        start_d = start
-    else:
-        start_d = None
-    if hasattr(end, "date"):
-        end_d = end
-    else:
-        end_d = None
+    # 날짜형 셀뿐 아니라 담당자가 '2026-11-12'처럼 문자로 타이핑한 날짜도 인식(예전엔 문자면
+    # 날짜를 못 읽어 보험료 0원, 날짜가 입력 형식 그대로 찍히는 문제가 생길 수 있었음)
+    start_d = _parse_date_val(start)
+    end_d = _parse_date_val(end)
     if start_d and end_d:
         days = (end_d - start_d).days
         premium = (property_premium + liability_premium) * days / 365
@@ -1604,7 +1601,7 @@ def _compute_new_store_cert_values(vals: dict, rate1_pct: float, rate2: float) -
         "has_liability": bool(pyeong),
         # 보험종기일이 이미 지난(오늘 이전) 건은 통합파일엔 기록해두되, 가입증명서는 만들 필요
         # 없음(사용자 요청) - 예: 뒤늦게 딸려온, 이미 끝난 단기 행사장 계약 등
-        "period_ended": bool(end_d and end_d.date() < dt.date.today()),
+        "period_ended": bool(end_d and end_d < dt.date.today()),
     }
 
 
