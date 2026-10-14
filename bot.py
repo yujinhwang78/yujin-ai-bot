@@ -1043,6 +1043,18 @@ def _is_placeholder_code(code) -> bool:
     return not all(_looks_like_store_code(seg) for seg in segments)
 
 
+def _is_company_refund(vals: dict) -> bool:
+    """폐점매장 행의 비고가 '㈜세정으로 환급'(본사 환급)인지 판단. 본사 환급 건은 매장주 서류
+    (사업자등록증/신분증/통장사본/개인정보동의서)가 필요 없으므로 폐점서류 저장·알림을 하지 않음
+    (유진님 지시, 2026-10-14). 비고가 비어 있거나 '매장주에게 환급'이면 기존대로 서류를 처리함."""
+    for v in vals.values():
+        if isinstance(v, str):
+            t = re.sub(r"\s+", "", unicodedata.normalize("NFC", v))
+            if "환급" in t and "세정" in t and "매장주" not in t:
+                return True
+    return False
+
+
 def _store_identity_key(vals: dict) -> tuple:
     """매장코드가 없어도 같은 매장인지 알아볼 수 있도록, 매장명+사업자번호(없으면 주소)로
     만드는 보조 식별 키. 공백/줄바꿈 차이는 무시함.
@@ -2324,6 +2336,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             closed_stores.append({
                 "store_name": str(vals.get("매장명") or "").strip(),
                 "owner_name": str(vals.get("대표자명") or "").strip(),
+                "company_refund": _is_company_refund(vals),
             })
 
     if not new_stores and not closed_count:
@@ -4294,6 +4307,9 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                     brand = result.get("brand")
                     # 메일에 폐점매장이 하나뿐일 때만, 매장명이 파일명에 없는 서류(예: 개인정보
                     # 동의서)도 키워드만으로 보충해서 채움. 여러 매장이면 모호해질 수 있어 끔.
+                    # ㈜세정(본사)으로 환급되는 매장은 매장주 서류가 필요 없어서 서류 저장·알림
+                    # 자체를 건너뜀(유진님 지시, 2026-10-14). 매장주에게 환급되는 매장만 처리함.
+                    closed_stores = [c for c in closed_stores if not c.get("company_refund")]
                     allow_fallback = len(closed_stores) == 1
                     for closed_store in closed_stores:
                         store_name = (closed_store.get("store_name") or "").strip()
