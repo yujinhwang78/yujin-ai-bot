@@ -1,5 +1,4 @@
 import os
-import sys
 import io
 import re
 import json
@@ -9,6 +8,7 @@ import unicodedata
 import base64
 import zipfile
 import asyncio
+import sys
 import datetime as dt
 from zoneinfo import ZoneInfo
 import logging
@@ -880,6 +880,19 @@ def _render_text_image(text: str, font_size_pt: float):
     return img, img.width / CERT_FONT_SCALE, img.height / CERT_FONT_SCALE, descent / CERT_FONT_SCALE
 
 
+POLICY_END_MMDD = (11, 12)  # ㈜세정 재산종합보험 증권 만기(갱신)일. 증권 보험기간은 11.12 00:01 ~ 11.12 00:01
+
+
+def _cert_end_time(data: dict) -> str:
+    """가입증명서 종기 시각. data에 end_time이 있으면 그대로, 없으면 종기일로 판단."""
+    if data.get("end_time"):
+        return data["end_time"]
+    end_d = _parse_date_val(data.get("end_date"))
+    if end_d and (end_d.month, end_d.day) == POLICY_END_MMDD:
+        return "00:01"
+    return "24:00"
+
+
 def _build_certificate_pdf(data: dict, brand: str) -> bytes:
     """브랜드별 실제 발급 예시 증명서를 원본 서식으로 그대로 쓰고, 매장마다 달라지는 5개 항목만
     흰색으로 덮은 뒤 새로 그려넣음. 증권번호/계약자/보험종목 등 나머지는 서식에 이미 올바르게
@@ -914,6 +927,11 @@ def _build_certificate_pdf(data: dict, brand: str) -> bytes:
     draw_text(122.7, period_bottom - 0.05, data["start_date"])
     cover(254.7, period_top, period_bottom, x1=315)
     draw_text(254.7, period_bottom - 0.05, data["end_date"])
+    # 종기 시각: 브랜드 서식마다 원문 시각이 달라서(월메이드 서식만 '24:00'으로 고정돼 있었음 →
+    # 11/12 만기 건이 24:00으로 발급되는 오류, 2026-10-13 충무상설직영특판점 사례) 서식 값을 쓰지 않고
+    # 항상 덮어씀. 증권 만기일(11/12)에 끝나면 증권과 동일하게 00:01, 그 전에 끝나는 단기 매장은 24:00.
+    cover(320.76, period_top, period_bottom, x1=351)
+    draw_text(320.76, period_bottom - 0.05, _cert_end_time(data))
 
     store_top = rows["store_name"]
     store_bottom = row_bottom(store_top)
@@ -1024,6 +1042,18 @@ def _is_placeholder_code(code) -> bool:
     if not segments:
         return True
     return not all(_looks_like_store_code(seg) for seg in segments)
+
+
+def _is_company_refund(vals: dict) -> bool:
+    """폐점매장 행의 비고가 '㈜세정으로 환급'(본사 환급)인지 판단. 본사 환급 건은 매장주 서류
+    (사업자등록증/신분증/통장사본/개인정보동의서)가 필요 없으므로 폐점서류 저장·알림을 하지 않음
+    (유진님 지시, 2026-10-14). 비고가 비어 있거나 '매장주에게 환급'이면 기존대로 서류를 처리함."""
+    for v in vals.values():
+        if isinstance(v, str):
+            t = re.sub(r"\s+", "", unicodedata.normalize("NFC", v))
+            if "환급" in t and "세정" in t and "매장주" not in t:
+                return True
+    return False
 
 
 def _store_identity_key(vals: dict) -> tuple:
@@ -1480,14 +1510,15 @@ def _parse_date_val(date_val) -> dt.date | None:
     직접 타이핑한 파일은 날짜가 진짜 날짜형이 아니라 문자열로 들어오는 경우가 있음."""
     if date_val is None:
         return None
-    if hasattr(date_val, "date"):
+    if isinstance(date_val, dt.datetime):
         return date_val.date()
     if isinstance(date_val, dt.date):
         return date_val
     s = str(date_val).strip()
     if not s:
         return None
-    for fmt in ("%y.%m.%d", "%Y.%m.%d", "%y-%m-%d", "%Y-%m-%d", "%y/%m/%d", "%Y/%m/%d"):
+    s = s.split(" ")[0]  # '2026-11-12 00:00:00' 처럼 시각이 붙은 문자열
+    for fmt in ("%y.%m.%d", "%Y.%m.%d", "%y-%m-%d", "%Y-%m-%d", "%y/%m/%d", "%Y/%m/%d", "%m/%d/%Y"):
         try:
             return dt.datetime.strptime(s, fmt).date()
         except ValueError:
@@ -1575,14 +1606,10 @@ def _compute_new_store_cert_values(vals: dict, rate1_pct: float, rate2: float) -
     liability_premium = pyeong * rate2
     start = vals.get("보험시작일")
     end = vals.get("보험종기일")
-    if hasattr(start, "date"):
-        start_d = start
-    else:
-        start_d = None
-    if hasattr(end, "date"):
-        end_d = end
-    else:
-        end_d = None
+    # 날짜형 셀뿐 아니라 담당자가 '2026-11-12'처럼 문자로 타이핑한 날짜도 인식(예전엔 문자면
+    # 날짜를 못 읽어 보험료 0원, 날짜가 입력 형식 그대로 찍히는 문제가 생길 수 있었음)
+    start_d = _parse_date_val(start)
+    end_d = _parse_date_val(end)
     if start_d and end_d:
         days = (end_d - start_d).days
         premium = (property_premium + liability_premium) * days / 365
@@ -1602,7 +1629,7 @@ def _compute_new_store_cert_values(vals: dict, rate1_pct: float, rate2: float) -
         "has_liability": bool(pyeong),
         # 보험종기일이 이미 지난(오늘 이전) 건은 통합파일엔 기록해두되, 가입증명서는 만들 필요
         # 없음(사용자 요청) - 예: 뒤늦게 딸려온, 이미 끝난 단기 행사장 계약 등
-        "period_ended": bool(end_d and end_d.date() < dt.date.today()),
+        "period_ended": bool(end_d and end_d < dt.date.today()),
     }
 
 
@@ -2325,6 +2352,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             closed_stores.append({
                 "store_name": str(vals.get("매장명") or "").strip(),
                 "owner_name": str(vals.get("대표자명") or "").strip(),
+                "company_refund": _is_company_refund(vals),
             })
 
     if not new_stores and not closed_count:
@@ -4203,6 +4231,49 @@ async def check_token_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
 
 
+async def check_gdrive_health(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """매일 아침 구글 드라이브 refresh token이 아직 유효한지 점검하고, 끊겼을 때에만 유진님께
+    텔레그램으로 알림(2026-10-21, 6일 주기 갱신 알림 대체). 일시적인 네트워크 오류로 잘못
+    알리지 않도록 한 번 더 시도한 뒤에도 실패할 때만 알림."""
+    global _gdrive_service
+    if not ALLOWED_USER_ID:
+        return
+    if not (
+        GDRIVE_OAUTH_CLIENT_ID and GDRIVE_OAUTH_CLIENT_SECRET and GDRIVE_OAUTH_REFRESH_TOKEN
+        and _gdrive_build
+    ):
+        return
+    last_err = None
+    for attempt in range(2):
+        try:
+            creds = _gdrive_user_credentials(
+                token=None,
+                refresh_token=GDRIVE_OAUTH_REFRESH_TOKEN,
+                client_id=GDRIVE_OAUTH_CLIENT_ID,
+                client_secret=GDRIVE_OAUTH_CLIENT_SECRET,
+                token_uri="https://oauth2.googleapis.com/token",
+            )
+            await asyncio.to_thread(creds.refresh, _gdrive_auth_request())
+            return  # 정상
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if attempt == 0:
+                await asyncio.sleep(60)
+    logger.error("구글 드라이브 연결 점검 실패: %s", last_err)
+    _gdrive_service = None  # 다음 사용 때 새 토큰으로 다시 연결하도록 캐시 비움
+    text = (
+        "⚠️ 구글 드라이브 연결이 끊겼어요. 파일이 드라이브에 저장되지 않을 수 있어요.\n\n"
+        "토큰을 새로 받아야 해요:\n"
+        "1. developers.google.com/oauthplayground 접속 → '1단계'에 "
+        "https://www.googleapis.com/auth/drive 입력 → 'API 권한 부여' → bubal5503@gmail.com 로그인 "
+        "('확인되지 않은 앱' 경고가 나오면 고급 → 이동)\n"
+        "2. '2단계'에서 '인증 코드를 토큰으로 교환하기' → refresh_token 값 복사\n"
+        "3. Render → yujin-ai-bot → Environment → GDRIVE_OAUTH_REFRESH_TOKEN 값 교체 → Save Changes\n\n"
+        "참고: 구글 클라우드 콘솔에서 앱 게시 상태가 '프로덕션'인지도 확인해주세요(테스트면 7일마다 끊겨요)."
+    )
+    await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
+
+
 async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
     global last_uid_seen
 
@@ -4304,6 +4375,9 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                     brand = result.get("brand")
                     # 메일에 폐점매장이 하나뿐일 때만, 매장명이 파일명에 없는 서류(예: 개인정보
                     # 동의서)도 키워드만으로 보충해서 채움. 여러 매장이면 모호해질 수 있어 끔.
+                    # ㈜세정(본사)으로 환급되는 매장은 매장주 서류가 필요 없어서 서류 저장·알림
+                    # 자체를 건너뜀(유진님 지시, 2026-10-14). 매장주에게 환급되는 매장만 처리함.
+                    closed_stores = [c for c in closed_stores if not c.get("company_refund")]
                     allow_fallback = len(closed_stores) == 1
                     for closed_store in closed_stores:
                         store_name = (closed_store.get("store_name") or "").strip()
@@ -4424,8 +4498,11 @@ def main() -> None:
     else:
         logger.info("GMAIL_ADDRESS/GMAIL_APP_PASSWORD가 없어 이메일 확인 기능은 꺼져 있습니다.")
 
-    app.job_queue.run_daily(check_token_reminder, time=dt.time(hour=8, minute=30, tzinfo=KST))
-    logger.info("구글 드라이브 토큰 갱신 알림 작업이 등록되었습니다(매일 08:30 KST에 확인).")
+    # 6일 주기 토큰 갱신 알림은 껐음(2026-10-21): 구글 앱을 '프로덕션'으로 게시해서 refresh
+    # token이 더 이상 7일마다 만료되지 않음. 대신 매일 아침 드라이브 연결만 점검해서, 끊겼을
+    # 때에만 알림을 보냄(check_gdrive_health).
+    app.job_queue.run_daily(check_gdrive_health, time=dt.time(hour=8, minute=30, tzinfo=KST))
+    logger.info("구글 드라이브 연결 점검 작업이 등록되었습니다(매일 08:30 KST, 끊겼을 때만 알림).")
 
     logger.info("봇을 시작합니다...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
