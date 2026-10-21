@@ -2413,6 +2413,16 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     }
 
 
+def _is_own_address(addr) -> bool:
+    """유진님 본인 메일 주소인지(대소문자 무시). 포워딩/테스트로 보낸 메일의 '보낸 사람'이 본인일 때
+    담당자로 잘못 인식하지 않기 위해 씀."""
+    if not addr:
+        return False
+    own = {a.strip().lower() for a in (GMAIL_ADDRESS, MAIL_FROM_ADDRESS, MAIL_REPLY_TO,
+                                       "yujin.hwang@daonins.co.kr") if a}
+    return str(addr).strip().lower() in own
+
+
 async def _sync_and_notify(
     bot, chat_id: int, file_bytes: bytes, requester_email: str | None = None
 ) -> dict | None:
@@ -2531,17 +2541,22 @@ async def _sync_and_notify(
         # 직접 올린 건이면 엑셀 '접수자' 이름으로 등록된 연락처를 찾음. 같은 담당자 앞으로
         # 신규매장이 여러 곳이면 메일을 여러 통 나눠 보내지 않고, 한 번에 묶어서 보냄.
         # 바로 보내지 않고 유진님이 버튼으로 확인한 뒤에 실제 발송함(원치 않으면 '대기' 선택 가능)
-        target_email = requester_email
+        # 보낸 사람이 유진님 본인 주소(포워딩/테스트 등)면 담당자로 취급하지 않음 - 안 그러면 담당자
+        # 연락처가 유진님 주소로 덮어써져서 가입증명서가 유진님께 가버림(2026-10-21 세정 김연희 건)
+        sender_for_contact = None if _is_own_address(requester_email) else requester_email
+        target_email = sender_for_contact
         received_by = store.get("received_by") or ""
         if not target_email and received_by:
             target_email = contacts.get(_norm_contact_name(received_by))
+            if _is_own_address(target_email):
+                target_email = None  # 이미 유진님 주소로 잘못 저장된 연락처는 무시
         if target_email and GMAIL_ADDRESS and GMAIL_APP_PASSWORD:
             # 메일로 들어와서 처음 알게 된 담당자면, 다음부터 텔레그램으로 직접 올려도
             # 이메일을 찾을 수 있도록 연락처에 미리 저장해둠(발송 여부와 무관하게 저장)
-            if requester_email and received_by:
+            if sender_for_contact and received_by:
                 key = _norm_contact_name(received_by)
-                if contacts.get(key) != requester_email:
-                    contacts[key] = requester_email
+                if contacts.get(key) != sender_for_contact:
+                    contacts[key] = sender_for_contact
                     _save_contacts(contacts)
             group = cert_groups.setdefault(target_email, {"received_by": "", "items": []})
             if received_by and not group["received_by"]:
