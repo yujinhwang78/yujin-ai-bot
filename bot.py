@@ -4206,6 +4206,49 @@ async def check_token_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
 
 
+async def check_gdrive_health(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """매일 아침 구글 드라이브 refresh token이 아직 유효한지 점검하고, 끊겼을 때에만 유진님께
+    텔레그램으로 알림(2026-10-21, 6일 주기 갱신 알림 대체). 일시적인 네트워크 오류로 잘못
+    알리지 않도록 한 번 더 시도한 뒤에도 실패할 때만 알림."""
+    global _gdrive_service
+    if not ALLOWED_USER_ID:
+        return
+    if not (
+        GDRIVE_OAUTH_CLIENT_ID and GDRIVE_OAUTH_CLIENT_SECRET and GDRIVE_OAUTH_REFRESH_TOKEN
+        and _gdrive_build
+    ):
+        return
+    last_err = None
+    for attempt in range(2):
+        try:
+            creds = _gdrive_user_credentials(
+                token=None,
+                refresh_token=GDRIVE_OAUTH_REFRESH_TOKEN,
+                client_id=GDRIVE_OAUTH_CLIENT_ID,
+                client_secret=GDRIVE_OAUTH_CLIENT_SECRET,
+                token_uri="https://oauth2.googleapis.com/token",
+            )
+            await asyncio.to_thread(creds.refresh, _gdrive_auth_request())
+            return  # 정상
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if attempt == 0:
+                await asyncio.sleep(60)
+    logger.error("구글 드라이브 연결 점검 실패: %s", last_err)
+    _gdrive_service = None  # 다음 사용 때 새 토큰으로 다시 연결하도록 캐시 비움
+    text = (
+        "⚠️ 구글 드라이브 연결이 끊겼어요. 파일이 드라이브에 저장되지 않을 수 있어요.\n\n"
+        "토큰을 새로 받아야 해요:\n"
+        "1. developers.google.com/oauthplayground 접속 → '1단계'에 "
+        "https://www.googleapis.com/auth/drive 입력 → 'API 권한 부여' → bubal5503@gmail.com 로그인 "
+        "('확인되지 않은 앱' 경고가 나오면 고급 → 이동)\n"
+        "2. '2단계'에서 '인증 코드를 토큰으로 교환하기' → refresh_token 값 복사\n"
+        "3. Render → yujin-ai-bot → Environment → GDRIVE_OAUTH_REFRESH_TOKEN 값 교체 → Save Changes\n\n"
+        "참고: 구글 클라우드 콘솔에서 앱 게시 상태가 '프로덕션'인지도 확인해주세요(테스트면 7일마다 끊겨요)."
+    )
+    await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
+
+
 async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
     global last_uid_seen
 
@@ -4430,8 +4473,11 @@ def main() -> None:
     else:
         logger.info("GMAIL_ADDRESS/GMAIL_APP_PASSWORD가 없어 이메일 확인 기능은 꺼져 있습니다.")
 
-    app.job_queue.run_daily(check_token_reminder, time=dt.time(hour=8, minute=30, tzinfo=KST))
-    logger.info("구글 드라이브 토큰 갱신 알림 작업이 등록되었습니다(매일 08:30 KST에 확인).")
+    # 6일 주기 토큰 갱신 알림은 껐음(2026-10-21): 구글 앱을 '프로덕션'으로 게시해서 refresh
+    # token이 더 이상 7일마다 만료되지 않음. 대신 매일 아침 드라이브 연결만 점검해서, 끊겼을
+    # 때에만 알림을 보냄(check_gdrive_health).
+    app.job_queue.run_daily(check_gdrive_health, time=dt.time(hour=8, minute=30, tzinfo=KST))
+    logger.info("구글 드라이브 연결 점검 작업이 등록되었습니다(매일 08:30 KST, 끊겼을 때만 알림).")
 
     logger.info("봇을 시작합니다...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
