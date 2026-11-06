@@ -3793,14 +3793,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "근처 맛집/장소 등 위치 기반 질문에는 이 정보를 활용해 웹 검색하세요."
         )
 
+    system_prompt += (
+        "\n\n메일, 접수 내역, 받은 서류, 개체번호처럼 메일로 받은 정보를 물으면 search_mail 도구로 실제 "
+        "메일함을 검색해서 답하세요. 검색 결과에 없는 내용은 지어내지 말고 못 찾았다고 말하세요. "
+        "찾지 못하면 검색어를 바꿔 한두 번 더 시도해도 됩니다."
+    )
+
     try:
-        response = client.messages.create(
-            model=MODEL_NAME,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=history,
-            tools=CHAT_TOOLS,
-        )
+        # 메일 검색 도구는 봇 서버에서 직접 실행해야 해서, Claude가 도구를 쓰겠다고 하면 실행
+        # 결과를 돌려주고 다시 묻는 과정을 몇 번 반복함(웹 검색은 Anthropic 쪽에서 알아서 처리됨)
+        tools = CHAT_TOOLS + ([MAIL_SEARCH_TOOL] if (GMAIL_ADDRESS and GMAIL_APP_PASSWORD) else [])
+        working = list(history)
+        response = None
+        for _ in range(6):
+            response = await asyncio.to_thread(
+                client.messages.create,
+                model=MODEL_NAME,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=working,
+                tools=tools,
+            )
+            if response.stop_reason not in ("tool_use", "pause_turn"):
+                break
+            assistant_blocks = [b.model_dump(exclude_none=True) for b in response.content]
+            working.append({"role": "assistant", "content": assistant_blocks})
+            if response.stop_reason == "pause_turn":
+                continue  # 웹 검색이 길어져 잠깐 멈춘 경우 - 그대로 이어서 요청
+            tool_results = []
+            for b in response.content:
+                if b.type == "tool_use":
+                    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+                    result = await _run_chat_tool(b.name, b.input or {})
+                    tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": result})
+            if not tool_results:
+                break
+            working.append({"role": "user", "content": tool_results})
         # 도구 사용(검색) 결과가 섞여 있을 수 있어 텍스트 블록만 모아서 답변으로 사용
         reply_text = "".join(
             block.text for block in response.content if block.type == "text"
@@ -3892,6 +3920,122 @@ def _extract_non_xlsx_attachments(msg: email.message.Message) -> list[tuple[str,
         if payload:
             attachments.append((filename, payload))
     return attachments
+
+
+# ===================== 대화 중 메일함 검색 도구 =====================
+# 텔레그램 대화에서 "내 메일에서 소 사고 접수 온 거 최근 개체번호 알려줘"처럼 물으면, Claude가
+# 이 도구로 실제 Gmail 메일함을 검색해서 본문/첨부 내용을 보고 답함(2026-11-06 유진님 요청).
+# 검색만 하고, 메일을 보내거나 지우거나 읽음 표시를 바꾸지 않음(BODY.PEEK로 읽기 전용 조회).
+
+MAIL_SEARCH_TOOL = {
+    "name": "search_mail",
+    "description": (
+        "유진님의 Gmail 메일함 전체(받은편지함, 보관된 메일 포함)를 검색해서 최근 메일부터 제목, 보낸사람, "
+        "날짜, 본문, 첨부파일 내용(엑셀/PDF 텍스트 일부)을 돌려줍니다. 사용자가 메일, 접수 내역, 받은 서류, "
+        "개체번호, 정산파일 등 메일로 받은 정보를 물으면 반드시 이 도구로 먼저 찾아보세요. "
+        "query에는 Gmail 검색 문법을 쓸 수 있습니다(예: '사고접수', 'from:sejung.co.kr', "
+        "'subject:가입 newer_than:30d', 'has:attachment 소 사고')."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Gmail 검색어(Gmail 검색창에 넣는 문법 그대로)"},
+            "max_results": {"type": "integer", "description": "가져올 최대 메일 수(기본 5, 최대 10)"},
+        },
+        "required": ["query"],
+    },
+}
+
+
+def _attachment_text_preview(filename: str, data: bytes, limit: int = 1500) -> str:
+    """첨부파일 안의 글자를 조금 뽑아냄(엑셀은 셀 값, PDF는 텍스트). 개체번호처럼 첨부에만
+    있는 정보도 찾을 수 있게 하려는 용도. 실패하면 빈 문자열."""
+    lower = filename.lower()
+    try:
+        if lower.endswith((".xlsx", ".xlsm")):
+            wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+            lines = []
+            for ws in wb.worksheets[:3]:
+                lines.append(f"[시트 {ws.title}]")
+                for row in ws.iter_rows(max_row=40, values_only=True):
+                    vals = [str(v) for v in row if v not in (None, "")]
+                    if vals:
+                        lines.append(" | ".join(vals))
+            return "\n".join(lines)[:limit]
+        if lower.endswith(".pdf"):
+            reader = PdfReader(io.BytesIO(data))
+            text = "\n".join((p.extract_text() or "") for p in reader.pages[:3])
+            return text[:limit]
+    except Exception:
+        return ""
+    return ""
+
+
+def _gmail_all_mail_box(imap) -> str:
+    """Gmail의 '전체보관함' 메일함 이름을 찾음(언어 설정에 따라 이름이 달라서 \\All 표시로 찾음)."""
+    try:
+        status, boxes = imap.list()
+        for line in boxes or []:
+            s = line.decode("utf-8", errors="ignore") if isinstance(line, bytes) else str(line)
+            if "\\All" in s:
+                m = re.search(r'"([^"]+)"\s*$', s)
+                if m:
+                    return f'"{m.group(1)}"'
+    except Exception:
+        pass
+    return "INBOX"
+
+
+def _search_mail_sync(query: str, max_results: int = 5) -> str:
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        return "메일 계정이 설정되어 있지 않아 검색할 수 없어요."
+    max_results = max(1, min(int(max_results or 5), 10))
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    try:
+        imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        imap.select(_gmail_all_mail_box(imap), readonly=True)
+        # 한글 검색어는 literal로 넘겨야 Gmail이 제대로 인식함
+        imap.literal = query.encode("utf-8")
+        status, data = imap.uid("SEARCH", "CHARSET", "UTF-8", "X-GM-RAW")
+        uids = (data[0] or b"").split() if data else []
+        if not uids:
+            return f"'{query}'로 검색된 메일이 없어요."
+        results = []
+        for uid in reversed(uids[-max_results:]):  # 최신 메일부터
+            status, msg_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
+            if not msg_data or not msg_data[0] or not isinstance(msg_data[0], tuple):
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subject = _decode_mime_words(msg.get("Subject", ""))
+            sender = _decode_mime_words(msg.get("From", ""))
+            date = msg.get("Date", "")
+            body = (_get_email_body(msg) or "").strip()[:2000]
+            att_parts = []
+            for fname, fbytes in _extract_xlsx_attachments(msg) + _extract_non_xlsx_attachments(msg):
+                preview = _attachment_text_preview(fname, fbytes)
+                att_parts.append(f"- {fname}" + (f"\n{preview}" if preview else ""))
+            att_text = "\n".join(att_parts) if att_parts else "(첨부 없음)"
+            results.append(
+                f"### 메일\n날짜: {date}\n보낸사람: {sender}\n제목: {subject}\n본문:\n{body}\n첨부:\n{att_text}"
+            )
+        return "\n\n".join(results)[:12000] or "검색은 됐지만 내용을 읽지 못했어요."
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+async def _run_chat_tool(name: str, tool_input: dict) -> str:
+    if name == "search_mail":
+        try:
+            return await asyncio.to_thread(
+                _search_mail_sync, str(tool_input.get("query") or ""), tool_input.get("max_results") or 5
+            )
+        except Exception as e:
+            logger.exception("메일 검색 도구 실행 중 오류")
+            return f"메일 검색 중 오류가 났어요: {type(e).__name__}"
+    return f"알 수 없는 도구: {name}"
 
 
 # 폐점필수서류로 인정하는 4종류와, 각각을 파일명에서 알아보는 키워드. 4종류가 전부 매칭돼야
