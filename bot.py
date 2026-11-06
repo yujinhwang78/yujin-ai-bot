@@ -220,17 +220,45 @@ CERT_TEMPLATES_DIR = os.path.join(PERSIST_DIR, "cert_templates")
 CERT_BUNDLED_TEMPLATES_DIR = os.path.join(_BASE_DIR, "assets", "cert_templates")
 
 SYSTEM_PROMPT = (
-    "당신은 사용자의 개인 AI 비서입니다. 한국어로 친절하고 간결하게 답변하세요. "
-    "불필요하게 길게 설명하지 말고, 핵심 위주로 답하세요. "
-    "날씨, 최신 뉴스, 맛집, 가격 등 최신 정보가 필요한 질문은 웹 검색 도구를 적극 활용하세요."
+    "당신은 황유진 대표님의 개인 AI 비서 '김대리'입니다. 대표님은 다온인슈 기업보험 전문컨설팅의 "
+    "대표이사이고 기업보험 전문 컨설턴트입니다(세정 등 법인 고객의 신규/폐점 매장 정산, 가입증명서 "
+    "발급 업무를 하십니다). 업무(보험, 정산, 문서, 메일)와 일상 이야기(고민, 건강, 취미, 잡담) 모두 "
+    "편하고 자연스러운 한국어 말투로 대화하세요. 딱딱한 보고서체보다는 믿을 수 있는 동료처럼 따뜻하게 "
+    "말하되, 존중하는 말투(~요체)를 유지하세요. 질문이 단순하면 짧게, 설명이 필요하거나 고민 상담처럼 "
+    "깊이 있는 대화가 필요하면 충분히 자세하게 답하세요. 모르는 것은 아는 척하지 말고 솔직히 말하세요. "
+    "날씨, 최신 뉴스, 맛집, 가격 등 최신 정보가 필요한 질문은 웹 검색 도구를 적극 활용하세요. "
+    "법률/세무/투자 판단은 확정적으로 단정하지 말고 판단에 필요한 사실과 전문가 확인이 필요함을 함께 알려주세요."
 )
 
 CHAT_TOOLS = [
     {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
 ]
 
-conversations: dict[int, list[dict]] = {}
-MAX_HISTORY = 20
+# 일반 대화 기억: 예전엔 20개까지만 기억하고 재배포하면 사라졌음(2026-11-06, 일상+업무 대화를
+# 하고 싶다는 유진님 요청으로 늘림). 파일로 저장해서 재시작해도 이어지도록 함. 단, Render에서
+# 영구 디스크(Persistent Disk)를 PERSIST_DIR로 연결해두지 않았다면 재배포 시 파일이 같이 사라짐.
+MAX_HISTORY = 80
+CHAT_HISTORY_FILE = os.path.join(PERSIST_DIR, "chat_history.json")
+
+
+def _load_conversations() -> dict:
+    try:
+        with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {int(k): v for k, v in raw.items() if isinstance(v, list)}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return {}
+
+
+def _save_conversations() -> None:
+    try:
+        with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v[-MAX_HISTORY:] for k, v in conversations.items()}, f, ensure_ascii=False)
+    except OSError:
+        logger.exception("대화 기록 저장 중 오류")
+
+
+conversations: dict[int, list[dict]] = _load_conversations()
 
 # 메일 감시용: 마지막으로 확인한 IMAP UID (재시작하면 초기화됨)
 last_uid_seen: int | None = None
@@ -284,6 +312,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     conversations.pop(update.effective_chat.id, None)
+    _save_conversations()
     await update.message.reply_text("대화 기록을 초기화했어요.")
 
 
@@ -3749,6 +3778,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history = conversations.setdefault(chat_id, [])
     history.append({"role": "user", "content": user_text})
     history = history[-MAX_HISTORY:]
+    # 잘라낸 뒤 맨 앞이 assistant 답변이면 API가 거부하므로, 항상 user 메시지로 시작하게 맞춤
+    while history and history[0].get("role") != "user":
+        history.pop(0)
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -3764,7 +3796,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         response = client.messages.create(
             model=MODEL_NAME,
-            max_tokens=1024,
+            max_tokens=2048,
             system=system_prompt,
             messages=history,
             tools=CHAT_TOOLS,
@@ -3781,8 +3813,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     history.append({"role": "assistant", "content": reply_text})
     conversations[chat_id] = history
+    _save_conversations()
 
-    await update.message.reply_text(reply_text)
+    # 텔레그램은 메시지 하나에 4096자까지만 보낼 수 있어서, 긴 답변은 나눠서 보냄
+    for i in range(0, len(reply_text), 4000):
+        await update.message.reply_text(reply_text[i:i + 4000])
 
 
 def _decode_mime_words(s: str) -> str:
