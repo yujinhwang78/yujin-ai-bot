@@ -2811,6 +2811,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await update.message.reply_text(
                     "처브 가입·해지 신청서 양식(추가가입_배서/해지_배서 시트)이 아니라서 처리하지 않았어요."
                 )
+        elif _sj_pdf_is_request(_extract_pdf_text(file_bytes)):
+            # PDF 변경신청서(2026-11-12부터 신청서는 PDF로 옴)
+            found = await asyncio.to_thread(
+                _sj_extract_request_from_text, filename, "", [_extract_pdf_text(file_bytes)]
+            )
+            brand = _sj_brand_from_text(filename, _extract_pdf_text(file_bytes))
+            items = [{"kind": f["kind"], "brand": brand, "store_name": f["store_name"], "fields": {}} for f in found]
+            for item in items:
+                _sj_remember_request(item, None, None, filename)
+            desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
+            cert_id = _queue_pending_certs(
+                [{"store_name": desc, "out_name": filename, "pdf_bytes": file_bytes}],
+                target_email=", ".join(CHUBB_RECIPIENTS),
+                subject=f"[㈜세정 {brand or ''}] 정산 양식 송부 ({desc})",
+                body=_CHUBB_REQUEST_BODY, label="변경신청서",
+            )
+            await update.message.reply_text(
+                f"📨 변경신청서로 확인했어요({brand or '브랜드 미확인'}, {desc}). 처브 담당자 4명에게 보낼까요?\n"
+                "(사업자등록증·통장사본 등 같이 보낼 서류가 있으면, 메일로 온 원본을 봇이 처리하게 두시는 게 좋아요)",
+                reply_markup=_queue_confirm_keyboard(cert_id),
+            )
         else:
             handled = await _sj_handle_cert_file(context.bot, filename, file_bytes)
             if not handled:
@@ -4346,255 +4367,6 @@ async def check_token_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
 
 
-# ---------------------------------------------------------------------------
-# 팜스코 소 가축재해보험 사고접수 자동 기재 (2026-11-12 추가)
-#  - farmscohw@gmail.com 이 보내는 "[보험 접수]" 메일을 주기적으로 읽어서, 구글 드라이브의
-#    「26년 계약리스트.xlsx」(소(240430)/26년) 사고내역 시트 다음 빈 행에 기재함.
-#  - PC가 꺼져 있어도 드라이브의 '같은 파일'을 덮어써서 저장 -> PC가 켜지면 드라이브 동기화로
-#    바탕화면 파일에도 그대로 반영됨. 백업 파일은 만들지 않음(유진님 요청).
-#  - 기재 칸: 날짜(발생일자) / 이력번호 / 농장명 / 증권번호 / 가입금액 / 사고내용(폐사·긴급출하).
-#    사고접수번호·처리경과는 유진님이 직접 입력(기존 방식 유지).
-#  - 중복 방지: 사고내역에 이미 있는 이력번호는 다시 쓰지 않음. 최근 CLAIMS_LOOKBACK_DAYS일
-#    메일을 매번 대조하므로, PC 엑셀에서 저장하다 봇이 쓴 행이 덮여 사라져도 다음 실행 때 다시 채움.
-# ---------------------------------------------------------------------------
-CLAIMS_SENDER = os.environ.get("CLAIMS_SENDER", "farmscohw@gmail.com")
-CLAIMS_XLSX_FILE_ID = os.environ.get("CLAIMS_XLSX_FILE_ID", "1hysBIWklqGKxW5_Un0blQUTpMMct3cXs")
-CLAIMS_CHECK_INTERVAL = int(os.environ.get("CLAIMS_CHECK_INTERVAL", "600"))
-CLAIMS_LOOKBACK_DAYS = int(os.environ.get("CLAIMS_LOOKBACK_DAYS", "7"))
-CLAIMS_SHEET = "사고내역"
-_claims_state: dict = {"last_md5": None, "seen_ids": set()}
-
-
-def _claims_norm_id(v) -> str:
-    """이력번호 비교용 정규화: 숫자만 남기고, 12자리 '002...' 형태면 앞의 '00'을 떼서
-    시트의 10자리 숫자(예: 2214485575)와 맞춤."""
-    d = re.sub(r"\D", "", str(v or ""))
-    if len(d) == 12 and d.startswith("00"):
-        d = d[2:]
-    return d
-
-
-def _claims_fmt_id(v) -> str:
-    """'002 2144 8557 5' 형태로 표기(사고내역 기존 표기와 동일)."""
-    d = re.sub(r"\D", "", str(v or ""))
-    if len(d) == 10:
-        d = "00" + d
-    if len(d) == 12:
-        return f"{d[:3]} {d[3:7]} {d[7:11]} {d[11]}"
-    return str(v or "").strip()
-
-
-def _claims_parse_mail(body: str) -> dict | None:
-    def grab(label):
-        m = re.search(label + r"\s*[:：]\s*(.+?)(?:\s*🐄|\n|$)", body)
-        return m.group(1).strip() if m else ""
-    kind = grab("발생구분")
-    farm = grab("발생농장")
-    animal = grab("개체번호")
-    date_s = grab("발생일자")
-    reason = grab("발생사유")
-    if not animal or not _claims_norm_id(animal):
-        return None
-    m = re.search(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})", date_s)
-    occur = dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
-    m2 = re.search(r"\(([^)]+)\)", kind)
-    accident = (m2.group(1) if m2 else kind).strip() or kind
-    return {"kind": kind, "accident": accident, "farm": farm, "animal": animal,
-            "occur": occur, "reason": reason}
-
-
-def _claims_fetch_mails() -> list[dict]:
-    """최근 CLAIMS_LOOKBACK_DAYS일 동안 온 사고접수 메일을 읽어서 파싱해 반환(오래된 순)."""
-    since = (dt.datetime.now(KST) - dt.timedelta(days=CLAIMS_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
-    imap = imaplib.IMAP4_SSL("imap.gmail.com")
-    out = []
-    try:
-        imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        imap.select("INBOX", readonly=True)  # 읽음 표시를 바꾸지 않음
-        _st, data = imap.uid("search", None, f'(FROM "{CLAIMS_SENDER}" SINCE {since})')
-        for uid in (data[0].split() if data and data[0] else []):
-            _st, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
-            if not msg_data or msg_data[0] is None:
-                continue
-            msg = email.message_from_bytes(msg_data[0][1])
-            subject = _decode_mime_words(msg.get("Subject", ""))
-            if "보험 접수" not in subject:
-                continue
-            parsed = _claims_parse_mail(_get_email_body(msg))
-            if parsed:
-                parsed["msg_id"] = msg.get("Message-ID", uid.decode())
-                out.append(parsed)
-    finally:
-        try:
-            imap.logout()
-        except Exception:
-            pass
-    return out
-
-
-def _claims_lookup(wb, animal_norm: str) -> dict:
-    """개체별 시트들에서 개체를 찾아 농장명·가입금액·농장관리번호를 돌려주고, 농장리스트에서
-    증권번호를 찾음. 사고 표시(폐사/긴급출하)를 남길 셀 위치도 같이 돌려줌."""
-    info = {"farm": None, "amount": None, "mgmt": None, "policy": None, "mark": None}
-    # 1) 4월 갱신 개체별: D=이력번호, K/L=농장관리번호, M=농장명(가입 기준), O=가입금액, U=사고표시
-    if "4월갱신시개체별" in wb.sheetnames:
-        ws = wb["4월갱신시개체별"]
-        for row in ws.iter_rows(min_row=2):
-            if (_claims_norm_id(row[3].value) == animal_norm
-                    and "재가입" in str(row[13].value or "")
-                    and isinstance(row[14].value, (int, float))):
-                # N열이 '재가입(..)'인 개체만 O열이 가입금액임('계약기간지속'은 O열이 다른 값이라
-                # 이 경우엔 월별 추징 시트의 보험가입금액을 씀)
-                info.update(farm=row[12].value or row[4].value, amount=row[14].value,
-                            mgmt=row[11].value, mark=(ws.title, row[20].coordinate))
-                break
-    # 2) 없거나 가입금액이 비어 있으면 월별 추징(신규 가입) 시트: C=이력번호, B=농장, K=농장관리번호, P=가입금액, T=사고표시
-    if info["amount"] in (None, ""):
-        for name in reversed(wb.sheetnames):
-            if "추징" not in name:
-                continue
-            ws = wb[name]
-            hit = None
-            for row in ws.iter_rows(min_row=2):
-                if len(row) > 19 and _claims_norm_id(row[2].value) == animal_norm and isinstance(row[15].value, (int, float)):
-                    hit = row
-                    break
-            if hit is not None:
-                info.update(farm=info["farm"] or hit[1].value, amount=hit[15].value,
-                            mgmt=info["mgmt"] or hit[10].value, mark=(ws.title, hit[19].coordinate))
-                break
-    # 3) 증권번호/농장명: 농장리스트에서 농장관리번호(O열)로 찾음. 같은 관리번호가 여러 개면 농장명까지 맞는 행.
-    if "농장리스트" in wb.sheetnames and info["mgmt"] is not None:
-        cands = []
-        for row in wb["농장리스트"].iter_rows(min_row=4, values_only=True):
-            if len(row) > 14 and row[14] is not None and str(row[14]).strip() == str(info["mgmt"]).strip() and row[8]:
-                cands.append(row)
-        pick = None
-        if len(cands) == 1:
-            pick = cands[0]
-        elif cands:
-            pick = next((c for c in cands if str(c[2]).strip() == str(info["farm"]).strip()), None)
-        if pick:
-            info["policy"] = pick[8]
-            info["farm"] = pick[2] if len(cands) == 1 else info["farm"]
-    return info
-
-
-def _claims_apply(wb, mails: list[dict]) -> list[dict]:
-    """사고내역 시트에 아직 없는 메일 건을 다음 빈 행에 기재. 기재한 건 목록을 반환."""
-    ws = wb[CLAIMS_SHEET]
-    existing = set()
-    total_row = None
-    for r in range(4, ws.max_row + 1):
-        if str(ws.cell(r, 2).value or "").strip() == "지급 보험금":
-            total_row = r
-            break
-        n = _claims_norm_id(ws.cell(r, 3).value)
-        if n:
-            existing.add(n)
-    added = []
-    for m in mails:
-        key = _claims_norm_id(m["animal"])
-        if key in existing:
-            continue
-        target = None
-        last = total_row or ws.max_row + 1
-        for r in range(4, last):
-            if all(ws.cell(r, c).value in (None, "") for c in range(2, 11)):  # A열(처리월 병합 라벨)은 제외
-                target = r
-                break
-        if target is None:
-            m["error"] = "사고내역 시트에 빈 행이 없음(합계행 위에 행을 추가해 주세요)"
-            added.append(m)
-            continue
-        info = _claims_lookup(wb, key)
-        ws.cell(target, 2).value = m["occur"]
-        if target > 4 and ws.cell(target - 1, 2).number_format:
-            ws.cell(target, 2).number_format = ws.cell(target - 1, 2).number_format
-        ws.cell(target, 3).value = _claims_fmt_id(m["animal"])
-        ws.cell(target, 4).value = info["farm"] or m["farm"]
-        ws.cell(target, 5).value = info["policy"]
-        ws.cell(target, 7).value = info["amount"]
-        ws.cell(target, 9).value = m["accident"]
-        if not ws.cell(target, 12).value and ws.cell(target - 1, 12).value:
-            ws.cell(target, 12).value = '="26-"&TEXT(ROW()-3,"000")'
-        if info["mark"]:
-            sh, coord = info["mark"]
-            if wb[sh][coord].value in (None, ""):
-                wb[sh][coord].value = m["accident"]
-        existing.add(key)
-        m.update(row=target, info=info)
-        added.append(m)
-    return added
-
-
-def _claims_run_once() -> list[dict] | None:
-    """한 번 실행. 기재한 건 목록(없으면 []), 드라이브 연결이 안 되면 None."""
-    mails = _claims_fetch_mails()
-    if not mails:
-        return []
-    service = _get_gdrive_service()
-    if service is None:
-        return None
-    meta = service.files().get(fileId=CLAIMS_XLSX_FILE_ID, fields="md5Checksum").execute()
-    new_ids = {m["msg_id"] for m in mails} - _claims_state["seen_ids"]
-    if not new_ids and meta.get("md5Checksum") == _claims_state["last_md5"]:
-        return []  # 새 메일도 없고 파일도 그대로면 다운로드 생략
-    content = _gdrive_download_file(service, CLAIMS_XLSX_FILE_ID)
-    if not content:
-        return None
-    wb = openpyxl.load_workbook(io.BytesIO(content))
-    added = _claims_apply(wb, mails)
-    if any("row" in a for a in added):
-        # 다운로드한 뒤에 다른 곳(PC 엑셀 등)에서 파일이 바뀌었으면 덮어쓰지 않고 다음 차례에 다시 시도
-        now_md5 = service.files().get(fileId=CLAIMS_XLSX_FILE_ID, fields="md5Checksum").execute().get("md5Checksum")
-        if now_md5 != meta.get("md5Checksum"):
-            logger.info("사고접수: 저장 직전 파일이 바뀌어 이번 차례는 건너뜀")
-            return []
-        buf = io.BytesIO()
-        wb.save(buf)
-        res = service.files().update(
-            fileId=CLAIMS_XLSX_FILE_ID,
-            media_body=_gdrive_media(buf.getvalue(), mimetype=_XLSX_MIMETYPE),
-            fields="md5Checksum",
-        ).execute()
-        _claims_state["last_md5"] = res.get("md5Checksum")
-    else:
-        _claims_state["last_md5"] = meta.get("md5Checksum")
-    _claims_state["seen_ids"] |= {m["msg_id"] for m in mails}
-    return added
-
-
-async def check_livestock_claims(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        return
-    try:
-        added = await asyncio.to_thread(_claims_run_once)
-    except Exception as e:
-        logger.exception("사고접수 자동 기재 중 오류")
-        await _send_message_retrying(
-            context.bot, ALLOWED_USER_ID,
-            f"⚠️ 소 사고접수 자동 기재 중 오류: {type(e).__name__}: {str(e)[:150]}",
-        )
-        return
-    if not added:
-        return
-    lines = ["🐄 소 사고접수 → 「26년 계약리스트」 사고내역에 기재했어요(드라이브 원본, PC 켜지면 자동 반영)"]
-    for a in added:
-        if "error" in a:
-            lines.append(f"⚠️ {a['farm']} / {a['animal']}: {a['error']}")
-            continue
-        info = a["info"]
-        occ = a["occur"].strftime("%m.%d") if a["occur"] else "?"
-        amt = f"{info['amount']:,}" if isinstance(info["amount"], (int, float)) else "확인필요"
-        lines.append(
-            f"• {a['row']}행: {info['farm'] or a['farm']} / {_claims_fmt_id(a['animal'])} / {occ} {a['accident']}"
-            f" / 가입금액 {amt} / 증권 {info['policy'] or '확인필요'}"
-        )
-    lines.append("사고접수번호·처리경과는 직접 입력해 주세요.")
-    await _send_message_retrying(context.bot, ALLOWED_USER_ID, "\n".join(lines))
-
-
 async def check_gdrive_health(context: ContextTypes.DEFAULT_TYPE) -> None:
     """매일 아침 구글 드라이브 refresh token이 아직 유효한지 점검하고, 끊겼을 때에만 유진님께
     텔레그램으로 알림(2026-10-21, 6일 주기 갱신 알림 대체). 일시적인 네트워크 오류로 잘못
@@ -4880,6 +4652,118 @@ async def _sj_handle_request_file(bot, filename: str, file_bytes: bytes,
     return True
 
 
+def _sj_pdf_is_request(text: str) -> bool:
+    t = (text or "").replace(" ", "").replace("\n", "")
+    return "변경승인신청서" in t or "RequestforPolicyAmend" in t
+
+
+_SJ_REQUEST_WORDS = ("신청", "요청")
+_SJ_REQUEST_KINDS = ("가입", "해지", "폐점", "배서", "변경", "추가")
+
+
+def _sj_extract_request_from_text(subject: str, body: str, pdf_texts: list) -> list:
+    """엑셀 신청서가 없을 때(PDF 신청서/본문만 있는 경우) 메일 제목·본문·PDF 글자에서
+    매장명과 추가/해지 구분을 Claude로 뽑음. [{store_name, kind}] 반환(못 찾으면 빈 목록)."""
+    system = (
+        "아래는 ㈜세정 담당자가 보낸 보험 변경신청 메일이에요. 신청 대상 매장과 신청 종류를 찾아 "
+        'JSON으로만 답하세요: {"stores": [{"store_name": 매장명, "kind": "추가" 또는 "해지" 또는 "비금액"}]}. '
+        "같은 매장에 해지와 추가가 같이 있으면 두 개로 나눠 적으세요. 가입/추가가입은 추가, 해지/폐점/환급은 해지예요."
+    )
+    content = f"제목: {subject}\n본문:\n{(body or '')[:3000]}\n\nPDF 내용:\n" + "\n---\n".join(t[:2000] for t in pdf_texts)
+    try:
+        resp = client.messages.create(
+            model=MODEL_NAME, max_tokens=500, system=system,
+            messages=[{"role": "user", "content": content[:9000]}],
+        )
+        raw = "".join(b.text for b in resp.content if b.type == "text")
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+        out = []
+        for st in data.get("stores") or []:
+            name = str(st.get("store_name") or "").strip()
+            kind = st.get("kind") if st.get("kind") in ("추가", "해지", "비금액") else "추가"
+            if name:
+                out.append({"store_name": name, "kind": kind})
+        return out
+    except Exception:
+        logger.exception("변경신청 메일 내용 읽기 중 오류")
+        return []
+
+
+async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
+                                  sender_email: str | None, sender_name: str | None) -> bool:
+    """세정 담당자의 변경신청 메일이면(엑셀 신청서, PDF 신청서, 또는 '가입/해지 신청' 메일+첨부)
+    첨부파일 전부(신청서+사업자등록증/통장사본/동의서 등)를 처브 4명에게 보낼지 확인 버튼을 띄우고,
+    매장별로 보낸 사람을 기억해둠. 처리했으면 True.
+    (예전엔 엑셀 신청서만 알아봐서, PDF 신청서로 온 메일을 그냥 넘겨버렸음 - 2026-11-12 김가진 건)"""
+    if sender_email and "chubb.com" in sender_email.lower():
+        return False
+    if _is_own_address(sender_email) or (sender_email or "").lower() == (GMAIL_ADDRESS or "").lower():
+        # 유진님이 직접 전달(포워딩)한 메일이면, 본문의 원래 보낸 사람(From/보낸 사람/Sender 줄)을
+        # 세정 담당자로 봄. 원래 보낸 사람을 못 찾으면 담당자 미확인으로 두고 나중에 물어봄.
+        m = re.search(r"(?:From|보낸\s*사람|Sender)\s*:\s*([^\n<]*)<?([\w.+-]+@[\w-]+\.[\w.]+)", body or "")
+        if m and "chubb.com" not in m.group(2).lower() and not _is_own_address(m.group(2)):
+            sender_name = m.group(1).strip().strip('"') or sender_name
+            sender_email = m.group(2)
+        else:
+            sender_email = None
+    xlsx = _extract_xlsx_attachments(msg)
+    others = _extract_non_xlsx_attachments(msg)
+    if not xlsx and not others:
+        return False
+
+    items = []
+    for fn, data in xlsx:
+        parsed = _sj_parse_request(data, fn)
+        if parsed:
+            items.extend(parsed)
+    pdf_texts, has_pdf_request = [], False
+    for fn, data in others:
+        if fn.lower().endswith(".pdf"):
+            t = _extract_pdf_text(data)
+            if _sj_is_chubb_cert_text(t):
+                return False  # 처브 증명서 메일(전달 포함)은 증명서 처리로 넘김
+            if _sj_pdf_is_request(t):
+                has_pdf_request = True
+            pdf_texts.append(t)
+    text_all = f"{subject} {body}"
+    looks_like_request = (
+        any(w in text_all for w in _SJ_REQUEST_WORDS) and any(k in text_all for k in _SJ_REQUEST_KINDS)
+    )
+    if not items and not has_pdf_request and not looks_like_request:
+        return False
+
+    brand = (next((i.get("brand") for i in items if i.get("brand")), None)
+             or _sj_brand_from_text(subject, body, *pdf_texts, *[fn for fn, _ in xlsx + others]))
+    if not items:
+        found = await asyncio.to_thread(_sj_extract_request_from_text, subject, body, pdf_texts)
+        items = [{"kind": f["kind"], "brand": brand, "store_name": f["store_name"], "fields": {}} for f in found]
+    for item in items:
+        item["brand"] = item.get("brand") or brand
+        _sj_remember_request(item, sender_email, sender_name, subject)
+
+    desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
+    attachments = xlsx + others
+    cert_id = _queue_pending_certs(
+        [{"store_name": desc, "out_name": fn, "pdf_bytes": data} for fn, data in attachments],
+        target_email=", ".join(CHUBB_RECIPIENTS),
+        subject=f"[㈜세정 {brand or ''}] 정산 양식 송부 ({desc})",
+        body=_CHUBB_REQUEST_BODY,
+        label="변경신청서",
+    )
+    files = ", ".join(fn for fn, _ in attachments)
+    await bot.send_message(
+        chat_id=ALLOWED_USER_ID,
+        text=(
+            f"📨 ㈜세정 변경신청 메일이 왔어요 ({brand or '브랜드 미확인'}, {desc}, 보낸 사람: "
+            f"{sender_name or ''} {sender_email or ''}).\n첨부 {len(attachments)}개({files})를 그대로 붙여서 "
+            f"처브 담당자 4명에게 보낼까요?"
+        ),
+        reply_markup=_queue_confirm_keyboard(cert_id),
+    )
+    return True
+
+
 # ---------- 처브 증명서(PDF) 읽기 ----------
 
 def _sj_is_chubb_cert_text(text: str) -> bool:
@@ -5000,6 +4884,36 @@ def _sj_month_folder(service, root_id: str, brand: str) -> str:
     return month_id
 
 
+_SJ_LOOKUP_RANGE_RE = re.compile(r"(최초가입전체리스트'?!\$[A-Z]+\$\d+:\$[A-Z]+\$)(\d+)")
+
+
+def _sj_extend_lookup_ranges(ws) -> int:
+    """해지매장 시트의 연간총보험료 수식(VLOOKUP)이 최초가입전체리스트의 일부 행까지만 보고 있으면
+    (예: $E$4:$V$293인데 리스트는 866행까지), 리스트 끝까지 보도록 범위를 자동으로 늘림
+    (2026-11-12 유진님 지시: 모자라면 봇이 알아서). 고친 칸 수를 반환."""
+    wb = ws.parent
+    last = 0
+    for n in wb.sheetnames:
+        if "최초가입" in unicodedata.normalize("NFC", n):
+            last = wb[n].max_row
+            break
+    if not last:
+        return 0
+    fixed = 0
+    for row in ws.iter_rows(min_row=4, max_row=ws.max_row):
+        for cell in row:
+            v = cell.value
+            if not (isinstance(v, str) and v.startswith("=") and "최초가입전체리스트" in v):
+                continue
+            new_v = _SJ_LOOKUP_RANGE_RE.sub(
+                lambda m: m.group(1) + str(max(int(m.group(2)), last)), v
+            )
+            if new_v != v:
+                cell.value = new_v
+                fixed += 1
+    return fixed
+
+
 def _sj_write_master(wb, brand: str, kind: str, values: dict) -> str:
     """통합관리리스트의 '{브랜드}_추가매장' 또는 '{브랜드}_해지매장' 시트 빈 줄에 기재.
     수식 칸은 건드리지 않고(맨 첫 데이터 줄의 수식을 복사), 이미 값이 들어 있는 칸(종기일 등
@@ -5022,6 +4936,8 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict) -> str:
     name_col = header.get("매장명")
     if name_col is None:
         raise ValueError(f"'{ws.title}' 시트에서 매장명 칸을 못 찾았어요")
+
+    _sj_extend_lookup_ranges(ws)
 
     template_row = 4
     target = template_row
@@ -5389,15 +5305,21 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
             #  - PDF 첨부가 처브 보험가입증명서/배서증명서면 -> 리스트 기재 + 드라이브 저장 + 세정 담당자 발송 준비
             sender_email = email.utils.parseaddr(sender)[1] or None
             sender_name = email.utils.parseaddr(sender)[0] or None
-            for att_filename, att_bytes in _extract_xlsx_attachments(msg):
-                try:
-                    await _sj_handle_request_file(context.bot, att_filename, att_bytes, sender_email, sender_name)
-                except Exception as e:
-                    logger.exception("변경신청서 처리 중 오류")
-                    await _send_message_retrying(
-                        context.bot, ALLOWED_USER_ID,
-                        f"⚠️ 메일 첨부 '{att_filename}' 처리 중 오류: {type(e).__name__}: {str(e)[:150]}",
-                    )
+            # 1) 세정 담당자의 변경신청 메일부터 확인(엑셀/PDF 신청서 + 첨부서류 전부를 처브로)
+            try:
+                handled_request = await _sj_handle_request_mail(
+                    context.bot, msg, subject, _get_email_body(msg), sender_email, sender_name
+                )
+            except Exception as e:
+                handled_request = True
+                logger.exception("변경신청 메일 처리 중 오류")
+                await _send_message_retrying(
+                    context.bot, ALLOWED_USER_ID,
+                    f"⚠️ 변경신청 메일('{subject}') 처리 중 오류: {type(e).__name__}: {str(e)[:150]}",
+                )
+            # 2) 신청 메일이 아니면 처브 증명서(PDF)인지 확인
+            if handled_request:
+                continue
             for att_filename, att_bytes in _extract_non_xlsx_attachments(msg):
                 if not att_filename.lower().endswith(".pdf"):
                     continue
@@ -5447,12 +5369,6 @@ def main() -> None:
         logger.info("이메일 확인 작업이 등록되었습니다 (%d초 간격).", MAIL_CHECK_INTERVAL)
     else:
         logger.info("GMAIL_ADDRESS/GMAIL_APP_PASSWORD가 없어 이메일 확인 기능은 꺼져 있습니다.")
-
-    if GMAIL_ADDRESS and GMAIL_APP_PASSWORD:
-        app.job_queue.run_repeating(
-            check_livestock_claims, interval=CLAIMS_CHECK_INTERVAL, first=60
-        )
-        logger.info("소 사고접수 자동 기재 작업이 등록되었습니다 (%d초 간격).", CLAIMS_CHECK_INTERVAL)
 
     # 6일 주기 토큰 갱신 알림은 껐음(2026-10-21): 구글 앱을 '프로덕션'으로 게시해서 refresh
     # token이 더 이상 7일마다 만료되지 않음. 대신 매일 아침 드라이브 연결만 점검해서, 끊겼을
