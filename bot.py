@@ -285,26 +285,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/towork - 집→회사 길찾기 (등록 필요)\n"
         "/tohome - 회사→집 길찾기 (등록 필요)\n"
         "/reset - 지금까지의 대화 기억 지우기\n"
-        "/setpolicy <브랜드명> <증권번호> - 브랜드별 증권번호 등록 (가입증명서에 사용)\n"
-        "/brands - 등록된 브랜드(통합파일) 목록 확인\n"
-        "/setbrandname <브랜드명> <표시할 이름> - 통합파일을 보내드릴 때 쓸 파일명 변경\n"
-        "/sendmaster <브랜드명> - 지금 저장된 통합파일을 새로 올리지 않고 다시 받아보기\n"
-        "/setbrandalias <다르게 인식된 이름> <진짜 브랜드명> - 담당자마다 다르게 적는 브랜드명을 하나로 통일\n"
-        "/setcerttemplate <브랜드명> - (예시 PDF에 답장하며 사용) 그 브랜드 전용 가입증명서 서식으로 등록\n"
-        "/setcontact <담당자 이름> <이메일> - 담당자 이메일 등록 (신규매장 가입증명서 발송용)\n"
+        "/setcontact <담당자 이름> <이메일> - ㈜세정 담당자 이메일 등록\n"
         "/contacts - 등록된 담당자 연락처 목록 보기\n"
-        "/pending - 대기 중인(아직 안 보낸) 가입증명서 목록 보기\n"
-        "/testmail <받는이메일> - 샘플 가입증명서로 메일 발송 테스트 (받는이메일 생략하면 내 메일로)\n\n"
-        "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n"
-        "가입증명서도 'OO점 가입증명서 찾아줘'처럼 편하게 말하면 등록된 매장 중에서 찾아서 다시 보내드려요.\n"
-        "'OO점 담당자한테 보내줘'라고 하면 등록된 담당자 이메일로 보낼지 확인 버튼을 띄워드려요.\n"
-        "폐점서류(사업자등록증/신분증/통장사본/개인정보동의서)도 명령어 없이 파일로 그냥 올려주시면, "
-        "매장을 자동으로 인식해서 4종류가 다 모였을 때 압축해서 구글 드라이브에 저장해드려요.\n\n"
-        "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
-        "메일에 정산양식 엑셀이 첨부되어 있으면, 다운로드 안 하셔도 자동으로 확인해서 신규/폐점 매장을 반영하고 가입증명서와 갱신된 통합파일을 보내드려요.\n"
+        "/pending - 대기 중인(아직 안 보낸) 메일 목록 보기\n\n"
+        "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?'처럼 물어보셔도 알아들어요.\n\n"
+        "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬 대화 중에 '내 메일에서 ~ 찾아줘'처럼 물어보셔도 돼요.\n"
+        "㈜세정 변경신청서(엑셀)가 오면 처브 담당자 4명에게 보낼지 물어보고, 처브 보험가입증명서/배서증명서(PDF)가 "
+        "오면 통합관리리스트에 적고 드라이브 정산관리 폴더에 저장한 뒤 세정 담당자에게 보낼지 물어봐요.\n"
         "날씨, 최신 뉴스, 맛집 등도 그냥 물어보시면 웹 검색해서 답해드려요.\n"
         "📎(첨부) 버튼으로 '위치'를 공유해주시면, 그 위치 기준으로 근처 맛집도 찾아드려요.\n\n"
-        "정산양식 엑셀 파일을 보내주시면, 브랜드별 통합파일과 비교해서 새로 추가된 매장을 찾아 가입증명서 PDF를 자동으로 만들어드리고, 갱신된 통합파일도 함께 보내드려요. 📄"
+        "변경신청서 엑셀이나 처브 증명서 PDF는 텔레그램으로 직접 올려주셔도 똑같이 처리해요. 📄"
     )
 
 
@@ -1891,7 +1881,7 @@ def _save_pending_certs(pending: dict) -> None:
         json.dump(pending, f, ensure_ascii=False, indent=2)
 
 
-def _queue_pending_certs(items: list, target_email: str, subject: str, body: str) -> str:
+def _queue_pending_certs(items: list, target_email: str, subject: str, body: str, label: str = "가입증명서") -> str:
     """가입증명서(한 담당자 앞으로 1건 이상)를 바로 보내지 않고 대기시켜둠.
     items: [{"store_name":..., "out_name":..., "pdf_bytes":...}, ...]
     유진님이 '보내기'를 누르면 그때 첨부를 모두 묶어서 실제 발송함."""
@@ -1910,6 +1900,7 @@ def _queue_pending_certs(items: list, target_email: str, subject: str, body: str
         "subject": subject,
         "body": body,
         "attachments": attachments,
+        "label": label,
     }
     _save_pending_certs(pending)
     return cert_id
@@ -1965,10 +1956,10 @@ async def handle_cert_confirmation(update: Update, context: ContextTypes.DEFAULT
                 attachments=mail_attachments,
             )
             _remove_pending_cert(cert_id)
-            await query.edit_message_text(f"✅ '{names_text}' 가입증명서를 {entry['target_email']}로 보냈어요.")
+            await query.edit_message_text(f"✅ '{names_text}' {entry.get('label', '가입증명서')}를 {entry['target_email']}로 보냈어요.")
         except Exception:
             logger.exception("대기 중이던 가입증명서 발송 중 오류")
-            await query.edit_message_text(f"⚠️ '{names_text}' 가입증명서 발송에 실패했어요. 이 메시지에서 다시 눌러 시도해주세요.")
+            await query.edit_message_text(f"⚠️ '{names_text}' {entry.get('label', '가입증명서')} 발송에 실패했어요. 이 메시지에서 다시 눌러 시도해주세요.")
     elif action == "holdcert":
         # 메시지와 버튼을 그대로 남겨둠 -> 명령어 없이도, 나중에 이 메시지를 찾아 스크롤해서
         # 그냥 다시 '보내기'를 누르기만 하면 됨. 살짝 알려주는 팝업만 띄우고 메시지는 안 건드림.
@@ -1977,7 +1968,7 @@ async def handle_cert_confirmation(update: Update, context: ContextTypes.DEFAULT
         await query.answer()
         names_text = ", ".join(entry["store_names"])
         _remove_pending_cert(cert_id)
-        await query.edit_message_text(f"🗑 '{names_text}' 가입증명서 발송을 취소했어요.")
+        await query.edit_message_text(f"🗑 '{names_text}' {entry.get('label', '가입증명서')} 발송을 취소했어요.")
 
 
 async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2798,108 +2789,37 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # 폐점필수서류로 보이는 파일(파일명에 사업자등록증/신분증/통장사본/개인정보 키워드가 있음)이면,
-    # 명령어 없이 바로 파일명에서 매장을 찾아 자동으로 모으고 4종류가 다 모이면 압축해서 저장함.
-    # 파일명에 단서가 없어도(예: 'OL인천구월점_251112.pdf'), 지금 이미 폐점서류를 모으고 있는
-    # 중이면(closure_buffers 진행 중) 파일을 직접 열어서(PDF 텍스트 -> Claude 비전) 확인함.
-    closure_category = _classify_closure_doc(filename)
-    is_doc_like = filename.lower().endswith((".pdf", ".jpg", ".jpeg", ".png"))
-    has_active_closure_context = bool(
-        context.user_data.get("closure_buffers") or context.user_data.get("awaiting_closure_store_for")
-    )
-    if closure_category is not None or (is_doc_like and has_active_closure_context):
-        try:
-            tg_file = await doc.get_file()
-            file_bytes = bytes(await tg_file.download_as_bytearray())
-        except Exception:
-            logger.exception("폐점서류 파일 다운로드 중 오류")
-            await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요. 다시 보내주세요.")
-            return
-        if closure_category is None:
-            closure_category = await _classify_closure_doc_deep(filename, file_bytes)
-        if closure_category is not None:
-            await _handle_closure_doc_upload(update, context, filename, file_bytes, category=closure_category)
-            return
-        if has_active_closure_context:
-            await update.message.reply_text(
-                f"'{filename}' 파일 내용을 확인해봤는데, 폐점필수서류(사업자등록증/신분증/통장사본/"
-                "개인정보동의서) 중 어디에도 해당하지 않는 것 같아요. 다른 파일이면 다시 보내주세요."
-            )
-            return
-        # 명확한 폐점서류도 아니고 진행 중인 수집도 없으면 아래 일반 처리로 계속 진행
-
-    # 유진님이 매장별로 미리 압축해서 올리는 zip 파일이면, 파일명에서 등록된 매장을 찾아
-    # 그대로(폐점필수서류 4종류가 안에 다 있는지 확인 후) 드라이브에 저장함
-    if filename.lower().endswith(".zip"):
-        store_index = _all_registered_store_rows()
-        known_names = (
-            set(store_index.keys())
-            | set(_all_closed_store_rows().keys())
-            | set(_all_initial_list_store_rows().keys())
-        )
-        norm_fname = re.sub(r"\s+", "", filename)
-        matched_name = None
-        for name in known_names:
-            if any(cand and cand in norm_fname for cand in _closure_store_name_candidates(name)):
-                matched_name = name
-                break
-        if matched_name:
-            matched_name, brand, owner_name = _resolve_closure_store(matched_name, store_index)
-            try:
-                tg_file = await doc.get_file()
-                file_bytes = bytes(await tg_file.download_as_bytearray())
-            except Exception:
-                logger.exception("폐점서류 zip 다운로드 중 오류")
-                await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요.")
-                return
-            if not _zip_has_all_closure_docs(file_bytes):
-                await update.message.reply_text(
-                    f"'{matched_name}' 매장으로 인식했는데, 압축파일 안에 폐점필수서류(사업자등록증/"
-                    "신분증/통장사본/개인정보동의서) 4종류가 다 확인되지 않아서 저장하지 않았어요."
-                )
-                return
-            zip_name = _closure_zip_name(matched_name, owner_name)
-            try:
-                saved = _upload_to_drive(
-                    zip_name, file_bytes, brand=brand, extra_subfolder="폐점서류", mimetype="application/zip",
-                )
-            except Exception:
-                logger.exception("폐점서류 zip 저장 중 오류")
-                saved = False
-            if saved:
-                await update.message.reply_text(f"✅ '{matched_name}' 폐점서류를 '{zip_name}'로 구글 드라이브에 저장했어요.")
-            else:
-                await update.message.reply_text("⚠️ 구글 드라이브 저장에 실패했어요.")
-            return
-        # 매장명을 못 찾았으면 일반 파일 처리로 계속 진행함(아래에서 xlsx가 아니라고 안내됨)
-
-    if not filename.lower().endswith(".xlsx"):
+    # ㈜세정 x 처브 업무(2026-11-12~): 변경신청서 엑셀 또는 처브 증명서 PDF를 직접 올린 경우.
+    # (예전 정산양식 동기화/가입증명서 생성/폐점서류 수집 로직은 껐음)
+    lower = filename.lower()
+    if not lower.endswith((".xlsx", ".pdf")):
         await update.message.reply_text(
-            "죄송해요, 지금은 정산양식 엑셀(.xlsx) 파일만 처리할 수 있어요."
+            "㈜세정 변경신청서(엑셀)나 처브 보험가입증명서/배서증명서(PDF)만 처리할 수 있어요."
         )
         return
-
-    # 서식(PDF)은 이제 브랜드마다 따로 있고 브랜드별로 나중에 확인하니, 여기서는 모든 브랜드가
-    # 공통으로 필요한 폰트 파일만 확인함(폰트가 없으면 글자 자체를 못 그리므로 확실한 차단 사유).
-    if not os.path.exists(CERT_FONT_PATH):
-        await update.message.reply_text("가입증명서 생성 기능이 아직 설정되지 않았어요.")
-        return
-
-    await update.message.reply_text("엑셀을 확인하고 있어요...")
-
     try:
         tg_file = await doc.get_file()
         file_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception:
-        logger.exception("엑셀 파일 다운로드 중 오류")
-        await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요.")
+        logger.exception("파일 다운로드 중 오류")
+        await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요. 다시 보내주세요.")
         return
-
-    result = await _sync_and_notify(context.bot, update.effective_chat.id, file_bytes)
-    if result is None:
-        await update.message.reply_text(
-            "이 엑셀 형식은 알아보지 못했어요. 각 시트 A1 셀에 '*. 브랜드명'이 적힌 정산양식인지 확인해주세요."
-        )
+    try:
+        if lower.endswith(".xlsx"):
+            handled = await _sj_handle_request_file(context.bot, filename, file_bytes, None, None)
+            if not handled:
+                await update.message.reply_text(
+                    "처브 가입·해지 신청서 양식(추가가입_배서/해지_배서 시트)이 아니라서 처리하지 않았어요."
+                )
+        else:
+            handled = await _sj_handle_cert_file(context.bot, filename, file_bytes)
+            if not handled:
+                await update.message.reply_text(
+                    "처브 보험가입증명서나 배서증명서로 보이지 않아서 처리하지 않았어요."
+                )
+    except Exception as e:
+        logger.exception("세정 파일 처리 중 오류")
+        await update.message.reply_text(f"⚠️ 처리 중 오류가 발생했어요: {type(e).__name__}: {str(e)[:150]}")
 
 
 def _send_email(to_addr: str, subject: str, body: str, attachments: list | None = None) -> None:
@@ -2926,7 +2846,8 @@ def _send_email(to_addr: str, subject: str, body: str, attachments: list | None 
     # (구글의 "다른 이메일 주소로 보내기" 별칭 인증이 되어 있어야 함)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_ADDRESS, [to_addr], msg.as_string())
+        recipients = [a.strip() for a in re.split(r"[,;]", to_addr) if a.strip()]
+        server.sendmail(GMAIL_ADDRESS, recipients, msg.as_string())
 
 
 _gdrive_service = None  # 매번 새로 로그인하지 않도록 한 번 만든 클라이언트를 재사용
@@ -3766,9 +3687,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # '대구방촌점 담당자한테 보내줘'처럼 담당자 발송을 요청한 경우를 먼저 확인하고(둘 다
     # '보내줘'에 걸리므로 순서가 중요함), 아니면 '계산점 가입증명서 찾아줘'처럼 자연스러운
     # 문장으로 재발급을 요청한 경우를 감지해서 처리
-    if await _handle_cert_send_to_contact_request(update, context, user_text):
-        return
-    if await _handle_cert_lookup_request(update, context, user_text):
+    # 처브 증명서를 보낼 세정 담당자를 물어본 상태면, 이 답장(이름/이메일)으로 발송 준비
+    # (예전 '가입증명서 찾아줘'/'담당자한테 보내줘' 기능은 2026-11-12 처브 전환으로 껐음)
+    if await _sj_handle_await_contact_reply(update, user_text):
         return
 
     # 자연스러운 문장으로 길찾기를 요청한 경우 감지해서 처리
@@ -4468,6 +4389,688 @@ async def check_gdrive_health(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
 
 
+# ===================== ㈜세정 x 처브 업무 (2026-11-12 보험사 변경 이후) =====================
+# 2026-11-12부터 ㈜세정 계약이 삼성화재 -> 처브(에이스아메리칸화재해상보험)로 바뀌면서, 봇이 직접
+# 가입증명서를 만들던 예전 로직은 전부 껐음(유진님 지시). 지금 흐름:
+#  1) 세정 담당자가 '변경신청서'(가입/해지 신청서 엑셀)를 보내면 -> 처브 담당자 4명에게 메일 발송
+#     (확인 버튼 후). 신청서 내용과 보낸 사람은 기억해둠.
+#  2) 처브에서 '보험가입증명서'(추가매장) 또는 '배서증명서'(환급/해지) PDF가 오면 ->
+#     통합관리리스트의 해당 브랜드 시트(추가매장/해지매장)에 기재, 드라이브 정산관리/브랜드/월 폴더에
+#     저장, 그 매장의 세정 담당자(신청서를 보낸 사람)에게 메일 발송(확인 버튼 후).
+#     담당자를 모르면 텔레그램으로 유진님께 이름(또는 이메일)을 물어봄.
+
+CHUBB_RECIPIENTS = [
+    "Seo-Hyun.Cho@Chubb.com",
+    "Ha-Na.Kim@Chubb.com",
+    "Chang-Ha.Lee@Chubb.com",
+    "Won.jang@Chubb.com",
+]
+SEJUNG_BRANDS = ("웰메이드", "올리비아로렌", "트레몰로")
+SEJUNG_POLICY_BRAND = {"310D260840": "웰메이드", "310D260841": "올리비아로렌", "310D260842": "트레몰로"}
+SEJUNG_BRAND_SYNONYMS = {"월메이드": "웰메이드", "오뷔엘알": "올리비아로렌", "OVLR": "올리비아로렌", "올리비아": "올리비아로렌"}
+SEJUNG_REQUESTS_FILE = os.path.join(PERSIST_DIR, "sejung_requests.json")
+SEJUNG_AWAIT_FILE = os.path.join(PERSIST_DIR, "sejung_await_contact.json")
+SEJUNG_PROCESSED_FILE = os.path.join(PERSIST_DIR, "sejung_processed_certs.json")
+SEJUNG_AWAIT_DIR = os.path.join(PERSIST_DIR, "sejung_await_files")
+# 드라이브 '정산관리' 폴더 id. 비워두면 이름('정산관리', 상위 폴더 '26년')으로 찾음.
+SEJUNG_FOLDER_ID = os.environ.get("SEJUNG_FOLDER_ID")
+
+_CHUBB_REQUEST_BODY = (
+    "안녕하세요\n"
+    "㈜세정 정산 양식 보내드립니다.\n"
+    "진행 부탁드리고, 서류 보내주시면 감사하겠습니다.\n"
+    "수고하세요\n\n"
+    "--\n" + _CERT_EMAIL_SIGNATURE
+)
+
+
+def _sejung_cert_body(kind: str) -> str:
+    what = "추가매장의 보험가입증명서를" if kind == "추가" else "해지매장의 변경증서(환급)를"
+    return (
+        "안녕하십니까~\n"
+        f"보내주신 {what} 보내드립니다.\n"
+        "업무에 참고하여 주시기 바랍니다.\n\n"
+        "즐거운 하루 보내십시요\n"
+        "감사합니다.\n"
+        "수고하세요\n\n"
+        "--\n" + _CERT_EMAIL_SIGNATURE
+    )
+
+
+def _sj_norm(s) -> str:
+    s = unicodedata.normalize("NFC", str(s or ""))
+    return re.sub(r"\s+", "", s).lower()
+
+
+def _sj_brand_from_text(*texts) -> str | None:
+    joined = " ".join(str(t or "") for t in texts)
+    for pno, brand in SEJUNG_POLICY_BRAND.items():
+        if pno in joined:
+            return brand
+    norm = unicodedata.normalize("NFC", joined)
+    for brand in SEJUNG_BRANDS:
+        if brand in norm:
+            return brand
+    for syn, brand in SEJUNG_BRAND_SYNONYMS.items():
+        if syn in norm:
+            return brand
+    return None
+
+
+def _sj_load(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+
+
+def _sj_save(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+
+
+def _sj_json_value(v):
+    if isinstance(v, (dt.datetime, dt.date)):
+        return v.strftime("%Y-%m-%d")
+    return v
+
+
+# ---------- 변경신청서(엑셀) 읽기 ----------
+
+def _sj_row_by_headers(ws, header_rows: tuple, data_row: int, first_col: int, last_col: int) -> dict:
+    """신청서 오른쪽의 '리스트 복사用' 줄을 헤더 이름 -> 값으로 읽음."""
+    out = {}
+    for col in range(first_col, last_col + 1):
+        label = None
+        for hr in header_rows:
+            v = ws.cell(row=hr, column=col).value
+            if v not in (None, ""):
+                label = v
+                break
+        if label is None:
+            continue
+        key = _norm_header(label)
+        val = ws.cell(row=data_row, column=col).value
+        if val in (None, "") or (isinstance(val, str) and val.startswith("#")):
+            continue
+        out[key] = val
+    return out
+
+
+def _sj_parse_request(file_bytes: bytes, filename: str = "") -> list | None:
+    """처브 '가입_해지신청서' 엑셀이면 [ {kind, brand, store_name, fields}, ... ] 반환.
+    신청서 형식이 아니면 None."""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    except Exception:
+        return None
+    names = wb.sheetnames
+    if not any(n.startswith(("추가가입_배서", "해지_배서", "비금액_배서")) for n in names):
+        return None
+
+    brand_hint_texts = [filename]
+    for n in names:
+        ws = wb[n]
+        for addr in ("F9", "O8", "D37", "D49"):
+            try:
+                brand_hint_texts.append(ws[addr].value)
+            except Exception:
+                pass
+    brand = _sj_brand_from_text(*brand_hint_texts)
+
+    items = []
+    for n in names:
+        ws = wb[n]
+        if n.startswith("추가가입_배서"):
+            store = ws["F19"].value
+            if not store:
+                continue
+            fields = _sj_row_by_headers(ws, (5, 4), 6, 25, 43)  # Y~AQ
+            fields.update({
+                "매장명": str(store).strip(),
+                "평수": ws["O19"].value or fields.get("평수"),
+                "건물": ws["F23"].value,
+                "시설/비품": ws["F24"].value,
+                "재고": ws["F25"].value,
+                "보험시작일": ws["O16"].value or fields.get("보험시작일"),
+            })
+            items.append({"kind": "추가", "brand": brand, "store_name": str(store).strip(), "fields": fields})
+        elif n.startswith("해지_배서"):
+            store = ws["D19"].value
+            if not store:
+                continue
+            fields = _sj_row_by_headers(ws, (11, 10), 12, 22, 35)  # V~AI
+            fields.update({
+                "매장명": str(store).strip(),
+                "폐점일": ws["O16"].value or fields.get("폐점일"),
+                "평수": ws["D20"].value,
+            })
+            items.append({"kind": "해지", "brand": brand, "store_name": str(store).strip(), "fields": fields})
+        elif n.startswith("비금액_배서"):
+            store = ws["F19"].value
+            if store:
+                items.append({"kind": "비금액", "brand": brand, "store_name": str(store).strip(), "fields": {}})
+    return items
+
+
+def _sj_remember_request(item: dict, sender_email: str | None, sender_name: str | None, filename: str) -> None:
+    requests = _sj_load(SEJUNG_REQUESTS_FILE, {})
+    key = f"{item.get('brand') or ''}|{_sj_norm(item['store_name'])}"
+    requests[key] = {
+        "kind": item["kind"],
+        "brand": item.get("brand"),
+        "store_name": item["store_name"],
+        "fields": {k: _sj_json_value(v) for k, v in (item.get("fields") or {}).items()},
+        "sender_email": None if _is_own_address(sender_email) else sender_email,
+        "sender_name": sender_name,
+        "filename": filename,
+        "received": dt.date.today().isoformat(),
+    }
+    _sj_save(SEJUNG_REQUESTS_FILE, requests)
+
+
+def _sj_find_request(brand: str | None, store_name: str) -> dict | None:
+    requests = _sj_load(SEJUNG_REQUESTS_FILE, {})
+    target = _sj_norm(store_name)
+    best = None
+    for key, rec in requests.items():
+        if brand and rec.get("brand") and rec.get("brand") != brand:
+            continue
+        name = _sj_norm(rec.get("store_name"))
+        if not name:
+            continue
+        if name == target:
+            return rec
+        if name in target or target in name:
+            best = best or rec
+    return best
+
+
+def _queue_confirm_keyboard(cert_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 보내기", callback_data=f"sendcert:{cert_id}"),
+        InlineKeyboardButton("⏸ 대기", callback_data=f"holdcert:{cert_id}"),
+        InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
+    ]])
+
+
+async def _sj_handle_request_file(bot, filename: str, file_bytes: bytes,
+                                  sender_email: str | None, sender_name: str | None) -> bool:
+    """변경신청서 엑셀이면 기억해두고 처브 4명에게 보낼지 확인 버튼을 띄움. 처리했으면 True."""
+    items = _sj_parse_request(file_bytes, filename)
+    if items is None:
+        return False
+    if not items:
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"⚠️ '{filename}'은 변경신청서 양식인데 매장명이 비어 있어서 어떤 매장 건인지 못 찾았어요. "
+            "그래도 처브로 보낼지 아래 버튼으로 정해주세요.",
+        )
+    for item in items:
+        _sj_remember_request(item, sender_email, sender_name, filename)
+
+    brand = next((i.get("brand") for i in items if i.get("brand")), None) or "브랜드 미확인"
+    desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
+    subject = f"[㈜세정 {brand}] 정산 양식 송부 ({desc})"
+    cert_id = _queue_pending_certs(
+        [{"store_name": desc, "out_name": filename, "pdf_bytes": file_bytes}],
+        target_email=", ".join(CHUBB_RECIPIENTS), subject=subject, body=_CHUBB_REQUEST_BODY,
+        label="변경신청서",
+    )
+    who = sender_email or "텔레그램 업로드"
+    await bot.send_message(
+        chat_id=ALLOWED_USER_ID,
+        text=(
+            f"📨 ㈜세정 변경신청서가 왔어요 ({brand}, {desc}, 보낸 사람: {who}).\n"
+            f"처브 담당자 4명({', '.join(CHUBB_RECIPIENTS)})에게 보낼까요?"
+        ),
+        reply_markup=_queue_confirm_keyboard(cert_id),
+    )
+    return True
+
+
+# ---------- 처브 증명서(PDF) 읽기 ----------
+
+def _sj_is_chubb_cert_text(text: str) -> bool:
+    t = text.replace(" ", "")
+    return ("보험가입증명서" in t or "배서증명서" in t or "CertificationofInsurance" in t
+            or "CertificationofEndorsement" in t) and ("처브" in t or "Chubb" in t or "CHUBB" in t or "ACE" in t)
+
+
+def _sj_extract_cert_fields(text: str) -> dict | None:
+    """PDF에서 뽑은 글자(순서가 뒤섞여 있음)를 Claude로 정리해서 필요한 값만 뽑음."""
+    system = (
+        "아래는 처브(에이스아메리칸화재해상보험)의 보험가입증명서 또는 배서증명서 PDF에서 뽑은 텍스트예요. "
+        "글자 순서가 뒤섞여 있으니 의미를 보고 값을 찾아서, 아래 JSON 형식으로만 답하세요(설명 없이).\n"
+        '{"doc_type": "가입증명서" 또는 "배서증명서", "endorsement_type": 배서구분 글자 그대로 또는 null, '
+        '"store_name": 보험가입증명서 수신인(매장명), "policy_no": 증권번호, "insured": 보험계약자 문구, '
+        '"address": 소재지 주소, "area_py": 면적 숫자, "stock": 재고 금액 숫자, "facility": 시설/비품 금액 숫자, '
+        '"building": 건물 금액 숫자, "total_insured": 총가입금액 숫자, "start_date": "YYYY-MM-DD", '
+        '"end_date": "YYYY-MM-DD", "base_date": 배서 기준일 "YYYY-MM-DD" 또는 null, '
+        '"annual_property_premium": 제1부문 연간보험료 숫자, "annual_liability_premium": 제4부문 연간보험료 숫자, '
+        '"total_premium": 총보험료 또는 배서보험료 숫자, "property_refund": 재물 환급보험료 숫자 또는 null, '
+        '"liability_refund": 배상 환급보험료 숫자 또는 null, "warehouse": 창고위치}\n'
+        "금액에 '-'만 있으면 0, 모르면 null로 두세요."
+    )
+    try:
+        resp = client.messages.create(
+            model=MODEL_NAME, max_tokens=800, system=system,
+            messages=[{"role": "user", "content": text[:8000]}],
+        )
+        raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None
+        data = json.loads(m.group(0))
+    except Exception:
+        logger.exception("처브 증명서 내용 읽기 중 오류")
+        return None
+    et = str(data.get("endorsement_type") or "")
+    if data.get("doc_type") == "가입증명서" or "추가" in et:
+        data["kind"] = "추가"
+    else:
+        data["kind"] = "해지"
+    return data
+
+
+def _sj_to_date(v):
+    if isinstance(v, (dt.datetime, dt.date)):
+        return v if isinstance(v, dt.datetime) else dt.datetime(v.year, v.month, v.day)
+    if isinstance(v, str):
+        m = re.search(r"(\d{4})[-./년\s]+(\d{1,2})[-./월\s]+(\d{1,2})", v)
+        if m:
+            return dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+
+# ---------- 드라이브: 정산관리 폴더 / 통합관리리스트 ----------
+
+_sejung_root_cache = None
+
+
+def _sj_find_root(service) -> str | None:
+    global _sejung_root_cache
+    if SEJUNG_FOLDER_ID:
+        return SEJUNG_FOLDER_ID
+    if _sejung_root_cache:
+        return _sejung_root_cache
+    resp = service.files().list(
+        q="name='정산관리' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id,name,parents)", pageSize=20,
+    ).execute()
+    files = resp.get("files", [])
+    chosen = None
+    for f in files:
+        for p in f.get("parents") or []:
+            try:
+                parent = service.files().get(fileId=p, fields="name").execute()
+                if unicodedata.normalize("NFC", parent.get("name", "")).strip() == "26년":
+                    chosen = f["id"]
+            except Exception:
+                pass
+    if chosen is None and len(files) == 1:
+        chosen = files[0]["id"]
+    _sejung_root_cache = chosen
+    return chosen
+
+
+def _sj_find_master(service, root_id: str) -> dict | None:
+    """정산관리 폴더(없으면 그 상위 폴더)에서 이름에 '통합관리'가 들어간 가장 최근 엑셀을 찾음."""
+    parents = [root_id]
+    try:
+        meta = service.files().get(fileId=root_id, fields="parents").execute()
+        parents += meta.get("parents") or []
+    except Exception:
+        pass
+    for pid in parents:
+        resp = service.files().list(
+            q=f"'{pid}' in parents and trashed=false and mimeType='{_XLSX_MIMETYPE}'",
+            fields="files(id,name,modifiedTime)", orderBy="modifiedTime desc", pageSize=50,
+        ).execute()
+        for f in resp.get("files", []):
+            name = unicodedata.normalize("NFC", f["name"])
+            if not name.startswith("~$") and "통합관리" in name:
+                return f
+    return None
+
+
+def _sj_month_folder(service, root_id: str, brand: str) -> str:
+    def _same(target):
+        t = _sj_norm(target)
+        return lambda name: _sj_norm(name) == t
+    brand_id = _gdrive_find_child_folder(service, root_id, _same(brand))
+    if brand_id is None:
+        brand_id = _gdrive_create_folder(service, root_id, brand)
+    today = dt.datetime.now(KST).date()
+    month_name = f"{today:%y}년 {today.month}월"
+    month_id = _gdrive_find_child_folder(service, brand_id, _same(month_name))
+    if month_id is None:
+        month_id = _gdrive_create_folder(service, brand_id, month_name)
+    return month_id
+
+
+def _sj_write_master(wb, brand: str, kind: str, values: dict) -> str:
+    """통합관리리스트의 '{브랜드}_추가매장' 또는 '{브랜드}_해지매장' 시트 빈 줄에 기재.
+    수식 칸은 건드리지 않고(맨 첫 데이터 줄의 수식을 복사), 이미 값이 들어 있는 칸(종기일 등
+    미리 넣어둔 값)도 덮어쓰지 않음. 기재한 위치 설명을 반환."""
+    want = "추가" if kind == "추가" else "해지"
+    ws = None
+    for n in wb.sheetnames:
+        nn = unicodedata.normalize("NFC", n)
+        if brand in nn and want in nn:
+            ws = wb[n]
+            break
+    if ws is None:
+        raise ValueError(f"통합관리리스트에 '{brand}_{want}매장' 시트가 없어요")
+
+    header = {}
+    for col in range(1, ws.max_column + 1):
+        label = ws.cell(row=3, column=col).value or ws.cell(row=2, column=col).value
+        if label not in (None, ""):
+            header.setdefault(_norm_header(label), col)
+    name_col = header.get("매장명")
+    if name_col is None:
+        raise ValueError(f"'{ws.title}' 시트에서 매장명 칸을 못 찾았어요")
+
+    template_row = 4
+    target = template_row
+    while ws.cell(row=target, column=name_col).value not in (None, ""):
+        target += 1
+
+    for col in range(1, ws.max_column + 1):
+        tcell = ws.cell(row=template_row, column=col)
+        cell = ws.cell(row=target, column=col)
+        if isinstance(cell, MergedCell):
+            continue
+        tv = tcell.value
+        if isinstance(tv, str) and tv.startswith("="):
+            if cell.value in (None, ""):
+                cell.value = Translator(tv, origin=tcell.coordinate).translate_formula(cell.coordinate) \
+                    if target != template_row else tv
+            continue
+        if target != template_row and cell.value in (None, "") and tcell.number_format:
+            cell.number_format = tcell.number_format
+
+    for key, col in header.items():
+        if key not in values or values[key] in (None, ""):
+            continue
+        cell = ws.cell(row=target, column=col)
+        if isinstance(cell, MergedCell):
+            continue
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            continue
+        # 보험 시작/종기/폐점일은 증명서 날짜가 정답이라, 양식에 미리 적힌 날짜가 있어도 덮어씀
+        if cell.value not in (None, "") and key not in ("보험시작일", "보험종기일", "폐점일"):
+            continue
+        v = values[key]
+        if key in ("접수일자", "보험시작일", "보험종기일", "폐점일"):
+            v = _sj_to_date(v) or v
+            if isinstance(v, dt.datetime):
+                cell.number_format = "yyyy-mm-dd"
+        cell.value = v
+    return f"'{ws.title}' 시트 {target}행"
+
+
+def _sj_build_values(kind: str, cert: dict, req: dict | None) -> dict:
+    f = dict((req or {}).get("fields") or {})
+    v = {
+        "접수자": f.get("접수자") or (req or {}).get("sender_name"),
+        "접수일자": f.get("접수일자") or (req or {}).get("received") or dt.date.today().isoformat(),
+        "매장명": (req or {}).get("store_name") or cert.get("store_name"),
+        "대표자명": f.get("대표자명"),
+        "사업자번호": f.get("사업자번호"),
+        "전화번호": f.get("전화번호"),
+        "매장주소": f.get("매장주소") or cert.get("address"),
+        "비고": f.get("비고"),
+    }
+    if kind == "추가":
+        v.update({
+            "매장코드": f.get("매장코드"),
+            "재고": cert.get("stock") if cert.get("stock") is not None else f.get("재고"),
+            "시설/비품": cert.get("facility") if cert.get("facility") is not None else f.get("시설/비품"),
+            "건물": cert.get("building") if cert.get("building") is not None else f.get("건물"),
+            "평수": cert.get("area_py") or f.get("평수"),
+            "보험시작일": cert.get("start_date") or f.get("보험시작일"),
+            "보험종기일": cert.get("end_date"),
+            "창고주소": cert.get("warehouse") or f.get("창고주소"),
+        })
+    else:
+        v.update({
+            "폐점일": cert.get("base_date") or cert.get("start_date") or f.get("폐점일"),
+            "재물부문환급": cert.get("property_refund") if cert.get("property_refund") is not None else f.get("재물부문환급"),
+            "영업부문환급": cert.get("liability_refund") if cert.get("liability_refund") is not None else f.get("영업부문환급"),
+        })
+    return v
+
+
+def _sj_lookup_store_code(wb, store_name: str) -> str | None:
+    """통합관리리스트의 최초가입전체리스트(C=매장코드, E=매장명)와 추가매장 시트에서 매장코드를 찾음."""
+    target = _sj_norm(store_name)
+    for n in wb.sheetnames:
+        ws = wb[n]
+        nn = unicodedata.normalize("NFC", n)
+        if "최초가입" in nn:
+            code_col, name_col = 3, 5
+        elif "추가" in nn:
+            code_col, name_col = 6, 5
+        else:
+            continue
+        for r in range(4, ws.max_row + 1):
+            name = _sj_norm(ws.cell(row=r, column=name_col).value)
+            code = ws.cell(row=r, column=code_col).value
+            if name and code and (name == target or name in target or target in name):
+                return str(code).strip()
+    return None
+
+
+def _sj_cert_filename(code: str | None, store: str, kind: str, cert: dict, req: dict | None) -> str:
+    """'매장코드_매장명_개시일(추가) 또는 해지일(해지).pdf' (유진님 지정 형식, 예: OLC0011_OL대전중리점_2026-11-12.pdf)"""
+    f = (req or {}).get("fields") or {}
+    if kind == "추가":
+        d = cert.get("start_date") or f.get("보험시작일")
+    else:
+        d = cert.get("base_date") or cert.get("start_date") or f.get("폐점일")
+    d = _sj_to_date(d)
+    date_text = d.strftime("%Y-%m-%d") if d else dt.date.today().isoformat()
+    safe_store = re.sub(r'[\\/:*?"<>|]', "", store).strip()
+    return f"{code or '코드미확인'}_{safe_store}_{date_text}.pdf"
+
+
+def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None,
+                              filename: str, pdf_bytes: bytes) -> tuple[str, str, str]:
+    """(통합리스트 기재 결과 문구, PDF 저장 결과 문구, 저장 파일명) 반환. 실패하면 오류 문구를 담음."""
+    store = (req or {}).get("store_name") or str(cert.get("store_name") or "").strip()
+    req_code = ((req or {}).get("fields") or {}).get("매장코드")
+    service = _get_gdrive_service()
+    if service is None:
+        name = _sj_cert_filename(req_code, store, kind, cert, req)
+        return ("❌ 구글 드라이브에 연결되지 않아 통합리스트에 기재하지 못했어요.",
+                "❌ 드라이브 저장 실패(연결 안 됨)", name)
+    root = _sj_find_root(service)
+    if root is None:
+        name = _sj_cert_filename(req_code, store, kind, cert, req)
+        return ("❌ 드라이브에서 '정산관리' 폴더를 못 찾았어요.",
+                "❌ 드라이브 저장 실패('정산관리' 폴더 없음)", name)
+
+    master, wb = None, None
+    try:
+        master = _sj_find_master(service, root)
+        if master is not None:
+            content = _gdrive_download_file(service, master["id"])
+            wb = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
+    except Exception:
+        logger.exception("통합관리리스트 열기 중 오류")
+
+    code = req_code or (_sj_lookup_store_code(wb, store) if wb is not None else None)
+    out_name = _sj_cert_filename(code, store, kind, cert, req)
+
+    # PDF 저장
+    try:
+        month_id = _sj_month_folder(service, root, brand)
+        service.files().create(
+            body={"name": out_name, "parents": [month_id]},
+            media_body=_gdrive_media(pdf_bytes, mimetype="application/pdf"), fields="id",
+        ).execute()
+        today = dt.datetime.now(KST).date()
+        saved_msg = f"💾 드라이브 정산관리/{brand}/{today:%y}년 {today.month}월 폴더에 '{out_name}'로 저장했어요."
+    except Exception as e:
+        logger.exception("처브 증명서 드라이브 저장 중 오류")
+        saved_msg = f"❌ 드라이브 저장 실패: {type(e).__name__}"
+
+    # 통합관리리스트 기재
+    try:
+        if master is None or wb is None:
+            list_msg = ("❌ 정산관리 폴더에서 '통합관리'가 들어간 엑셀을 못 찾아 리스트에 기재하지 못했어요. "
+                        "통합관리리스트 파일을 정산관리 폴더에 넣어주세요.")
+        else:
+            values = _sj_build_values(kind, cert, req)
+            if code and not values.get("매장코드"):
+                values["매장코드"] = code
+            where = _sj_write_master(wb, brand, kind, values)
+            out = io.BytesIO()
+            wb.save(out)
+            ok = _save_brand_master_to_drive(master["id"], out.getvalue())
+            list_msg = (f"✅ 통합관리리스트('{master['name']}') {where}에 기재했어요."
+                        if ok else "❌ 통합관리리스트 저장에 실패했어요.")
+    except Exception as e:
+        logger.exception("통합관리리스트 기재 중 오류")
+        list_msg = f"❌ 통합관리리스트 기재 실패: {type(e).__name__}: {str(e)[:150]}"
+    return list_msg, saved_msg, out_name
+
+
+async def _sj_queue_to_sejung(bot, target_email: str, store: str, kind: str, brand: str,
+                              filename: str, pdf_bytes: bytes, who: str) -> None:
+    label = "보험가입증명서" if kind == "추가" else "변경증서(환급)"
+    cert_id = _queue_pending_certs(
+        [{"store_name": store, "out_name": filename, "pdf_bytes": pdf_bytes}],
+        target_email=target_email,
+        subject=f"[㈜세정 {brand}] {store} {label}",
+        body=_sejung_cert_body(kind),
+        label=label,
+    )
+    await bot.send_message(
+        chat_id=ALLOWED_USER_ID,
+        text=f"세정 담당자 {who}에게 '{store}' {label}를 보낼까요?",
+        reply_markup=_queue_confirm_keyboard(cert_id),
+    )
+
+
+async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes) -> bool:
+    """처브 보험가입증명서/배서증명서 PDF면 리스트 기재 + 드라이브 저장 + 세정 담당자 발송 준비.
+    처리했으면 True(증명서가 아니면 False)."""
+    text = _extract_pdf_text(pdf_bytes)
+    if not text or not _sj_is_chubb_cert_text(text):
+        return False
+
+    import hashlib
+    digest = hashlib.sha1(pdf_bytes).hexdigest()
+    processed = _sj_load(SEJUNG_PROCESSED_FILE, {})
+    if digest in processed:
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"ℹ️ '{filename}'은 이미 처리한 증명서라 다시 처리하지 않았어요({processed[digest]}).",
+        )
+        return True
+
+    cert = await asyncio.to_thread(_sj_extract_cert_fields, text)
+    if not cert or not cert.get("store_name"):
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"⚠️ '{filename}'은 처브 증명서 같은데 매장명을 읽지 못했어요. 직접 확인해주세요.",
+        )
+        return True
+    brand = _sj_brand_from_text(cert.get("policy_no"), cert.get("insured"), filename)
+    if brand is None:
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"⚠️ '{filename}'({cert.get('store_name')})의 브랜드를 알아보지 못했어요. 직접 확인해주세요.",
+        )
+        return True
+    kind = cert["kind"]
+    store = str(cert["store_name"]).strip()
+    req = _sj_find_request(brand, store)
+
+    list_msg, saved_msg, out_name = await asyncio.to_thread(
+        _sj_record_cert_to_drive, brand, kind, cert, req, filename, pdf_bytes
+    )
+    filename = out_name  # 세정 담당자에게 보내는 첨부파일 이름도 같은 형식으로
+    kind_label = "추가매장 보험가입증명서" if kind == "추가" else "해지매장 변경증서(환급)"
+    await _send_message_retrying(
+        bot, ALLOWED_USER_ID,
+        f"📄 처브 {kind_label} 도착: {brand} {store}\n{list_msg}\n{saved_msg}",
+    )
+    processed[digest] = f"{dt.date.today().isoformat()} {brand} {store}"
+    _sj_save(SEJUNG_PROCESSED_FILE, processed)
+
+    target = (req or {}).get("sender_email")
+    if target:
+        await _sj_queue_to_sejung(bot, target, store, kind, brand, filename, pdf_bytes,
+                                  (req or {}).get("sender_name") or target)
+    else:
+        # 담당자를 모르면 유진님께 물어봄 - 답장(이름 또는 이메일)을 받으면 그때 발송 준비
+        os.makedirs(SEJUNG_AWAIT_DIR, exist_ok=True)
+        path = os.path.join(SEJUNG_AWAIT_DIR, f"{digest}.pdf")
+        with open(path, "wb") as f:
+            f.write(pdf_bytes)
+        awaiting = _sj_load(SEJUNG_AWAIT_FILE, [])
+        awaiting.append({"store": store, "kind": kind, "brand": brand, "filename": filename, "path": path})
+        _sj_save(SEJUNG_AWAIT_FILE, awaiting)
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"❓ '{store}' {kind_label}를 보낼 ㈜세정 담당자를 모르겠어요(신청서가 메일로 온 기록이 없어요). "
+            "담당자 이름이나 이메일을 답장으로 보내주세요.",
+        )
+    return True
+
+
+async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool:
+    """담당자를 물어본 상태에서 유진님이 보낸 답(이름 또는 이메일)을 처리. 처리했으면 True."""
+    awaiting = _sj_load(SEJUNG_AWAIT_FILE, [])
+    if not awaiting:
+        return False
+    text = user_text.strip()
+    if text.startswith("/"):
+        return False
+    item = awaiting[0]
+    email_match = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text)
+    target, who = None, text
+    if email_match:
+        target = email_match.group(0)
+    else:
+        contacts = _load_contacts()
+        target = contacts.get(_norm_contact_name(text))
+        if target and _is_own_address(target):
+            target = None
+    if not target:
+        await update.message.reply_text(
+            f"'{text}' 담당자의 이메일이 등록돼 있지 않아요. 이메일 주소를 그대로 보내주시거나, "
+            "/setcontact 이름 이메일 로 등록한 뒤 이름을 다시 보내주세요. "
+            f"(대기 중인 건: {item['store']})"
+        )
+        return True
+    try:
+        with open(item["path"], "rb") as f:
+            pdf_bytes = f.read()
+    except OSError:
+        awaiting.pop(0)
+        _sj_save(SEJUNG_AWAIT_FILE, awaiting)
+        await update.message.reply_text("⚠️ 대기 중이던 증명서 파일을 찾지 못했어요. 처브 메일에서 직접 보내주세요.")
+        return True
+    awaiting.pop(0)
+    _sj_save(SEJUNG_AWAIT_FILE, awaiting)
+    try:
+        os.remove(item["path"])
+    except OSError:
+        pass
+    await _sj_queue_to_sejung(update.get_bot(), target, item["store"], item["kind"], item["brand"],
+                              item["filename"], pdf_bytes, who)
+    if awaiting:
+        await update.message.reply_text(f"다음으로 '{awaiting[0]['store']}' 담당자도 알려주세요.")
+    return True
+
+
 async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
     global last_uid_seen
 
@@ -4532,119 +5135,30 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text = f"📬 새 메일 도착\n\n보낸사람: {sender}\n제목: {subject}\n\n요약:\n{summary}"
                 await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=text)
 
-            # 정산양식 엑셀 첨부파일이 있으면 자동으로 브랜드 통합파일과 동기화하고,
-            # 새로 만들어진 가입증명서는 이 메일을 보낸 사람에게도 자동으로 보내줌
+            # ㈜세정 x 처브 업무(2026-11-12~): 예전 정산양식/가입증명서 생성/폐점서류 로직은 끔.
+            #  - 엑셀 첨부가 변경신청서면 -> 처브 4명에게 보낼지 확인 버튼
+            #  - PDF 첨부가 처브 보험가입증명서/배서증명서면 -> 리스트 기재 + 드라이브 저장 + 세정 담당자 발송 준비
             sender_email = email.utils.parseaddr(sender)[1] or None
+            sender_name = email.utils.parseaddr(sender)[0] or None
             for att_filename, att_bytes in _extract_xlsx_attachments(msg):
                 try:
-                    result = await _sync_and_notify(
-                        context.bot, ALLOWED_USER_ID, att_bytes, requester_email=sender_email
-                    )
-                except Exception:
-                    # 예전엔 여기서 조용히 continue만 해서, 가입증명서 PDF는 이미 보내진
-                    # 뒤 그 다음 단계(통합파일 저장 결과/담당자 발송 버튼)에서 오류가 나면
-                    # 유진님은 아무 알림도 못 받고 뭐가 잘못됐는지 알 수 없었음(2026-10-02
-                    # 유진님이 '신규매장 저장/메일발송이 안 되는 것 같다'며 지적). 이제는
-                    # 반드시 텔레그램으로 알려드림(Render 로그도 그대로 남겨둠).
-                    logger.exception("메일 첨부 엑셀 처리 중 오류")
+                    await _sj_handle_request_file(context.bot, att_filename, att_bytes, sender_email, sender_name)
+                except Exception as e:
+                    logger.exception("변경신청서 처리 중 오류")
                     await _send_message_retrying(
                         context.bot, ALLOWED_USER_ID,
-                        f"⚠️ 메일 첨부 '{att_filename}' 처리 중 오류가 발생했어요. 가입증명서는 "
-                        "이미 보내드렸을 수 있지만, 통합파일 저장이나 담당자 발송 확인 단계까지 "
-                        "끝났는지는 확인이 안 됐어요. Render 로그를 확인해주세요.",
+                        f"⚠️ 메일 첨부 '{att_filename}' 처리 중 오류: {type(e).__name__}: {str(e)[:150]}",
                     )
+            for att_filename, att_bytes in _extract_non_xlsx_attachments(msg):
+                if not att_filename.lower().endswith(".pdf"):
                     continue
-                if result is None:
-                    # 정산양식 형식이 아닌 일반 첨부파일일 수 있으니 조용히 넘어감
-                    logger.info("메일 첨부파일 '%s'은 정산양식 형식이 아니라 건너뜀", att_filename)
-                    continue
-
-                # 폐점매장이 있고, 같은 메일에 폐점필수서류(사업자등록증/주민등록증/통장사본/
-                # 개인정보처리동의서)가 매장명과 함께 첨부되어 있으면 압축해서 드라이브에 저장함.
-                # 4종류가 다 안 갖춰진 매장은 조용히 건너뜀(유진님이 정해주신 기준).
-                closed_stores = result.get("closed_stores") or []
-                if closed_stores:
-                  try:
-                    other_attachments = _extract_non_xlsx_attachments(msg)
-                    brand = result.get("brand")
-                    # 메일에 폐점매장이 하나뿐일 때만, 매장명이 파일명에 없는 서류(예: 개인정보
-                    # 동의서)도 키워드만으로 보충해서 채움. 여러 매장이면 모호해질 수 있어 끔.
-                    # ㈜세정(본사)으로 환급되는 매장은 매장주 서류가 필요 없어서 서류 저장·알림
-                    # 자체를 건너뜀(유진님 지시, 2026-10-14). 매장주에게 환급되는 매장만 처리함.
-                    closed_stores = [c for c in closed_stores if not c.get("company_refund")]
-                    allow_fallback = len(closed_stores) == 1
-                    for closed_store in closed_stores:
-                        store_name = (closed_store.get("store_name") or "").strip()
-                        owner_name = (closed_store.get("owner_name") or "").strip()
-                        if not store_name:
-                            # 통합파일엔 폐점 처리가 됐지만 매장명을 못 읽어서 서류 자동 저장을
-                            # 할 수 없는 경우. 예전엔 조용히 건너뛰어서 유진님이 모르고 넘어갈 수
-                            # 있었음 - 이제는 반드시 알려드림.
-                            await _send_message_retrying(
-                                context.bot, ALLOWED_USER_ID,
-                                "⚠️ 폐점 매장이 처리됐는데 매장명을 확인하지 못해서 "
-                                "폐점서류 자동 저장은 건너뛰었어요. 통합파일에서 직접 확인 부탁드려요.",
-                            )
-                            continue
-                        zip_name = _closure_zip_name(store_name, owner_name)
-                        saved = False
-                        missing = None
-                        try:
-                            # 1) 유진님이 이미 매장별로 압축해서 보낸 zip이 있으면 그걸 그대로 씀
-                            existing_zip = _find_store_zip_attachment(store_name, other_attachments)
-                            if existing_zip is not None and _zip_has_all_closure_docs(existing_zip[1]):
-                                matched = _unzip_closure_docs(existing_zip[1])
-                            else:
-                                # 2) 나열된 개별 첨부파일에서 4종류를 찾아봄(파일명으로 안 되면
-                                # 내용을 직접 열어서도 확인함 - 예: 'OL인천구월점_251112.pdf')
-                                matched = await _match_closure_docs_with_content(
-                                    store_name, other_attachments, allow_no_name_fallback=allow_fallback
-                                )
-                            # 일부만 모였어도 일단 저장함(드라이브에 이미 저장된 게 있으면 합쳐서).
-                            # 예전엔 4종류가 다 갖춰질 때까지 아예 저장을 안 해서, 나머지 서류가
-                            # 뒤늦게 들어와도 이번 메일 것만으로는 매번 처음부터 다시 모아야
-                            # 했음(유진님 피드백으로 변경, 2026-09-18).
-                            saved, merged = _save_closure_zip_merged(store_name, owner_name, brand, matched)
-                            missing = [c for c in _CLOSURE_DOC_KEYWORDS if c not in merged]
-                        except Exception:
-                            logger.exception("폐점서류 압축/저장 중 오류")
-                            saved = False
-                        # 성공/실패/서류 부족 여부를 항상 알려드림(예전엔 성공했을 때만 알려드려서,
-                        # 저장이 안 됐을 때 유진님이 알 방법이 없었음 — 유진님 피드백으로 추가).
-                        if saved and not missing:
-                            await _send_message_retrying(
-                                context.bot, ALLOWED_USER_ID,
-                                f"💾 '{zip_name}' 로 폐점서류를 구글 드라이브에 저장했어요.",
-                            )
-                        elif saved and missing:
-                            n = 4 - len(missing)
-                            await _send_message_retrying(
-                                context.bot, ALLOWED_USER_ID,
-                                f"💾 '{store_name}' 폐점서류를 일부 저장했어요 ({n}/4, '{zip_name}'). "
-                                f"부족한 서류: {', '.join(missing)}. 나머지 서류를 받으시면 봇에 파일로 "
-                                "그냥 올려주세요. 자동으로 이어서 채워드려요.",
-                            )
-                        elif missing:
-                            await _send_message_retrying(
-                                context.bot, ALLOWED_USER_ID,
-                                f"⚠️ '{store_name}' 폐점 처리는 됐는데, 폐점필수서류도 다 안 갖춰졌고 "
-                                f"(부족한 서류: {', '.join(missing)}) 구글 드라이브 저장에도 실패했어요. "
-                                "드라이브 연결 설정을 확인해주세요.",
-                            )
-                        else:
-                            await _send_message_retrying(
-                                context.bot, ALLOWED_USER_ID,
-                                f"❌ '{zip_name}' 구글 드라이브 저장에 실패했어요. "
-                                "드라이브 연결 설정(GDRIVE_OAUTH_* / GDRIVE_FOLDER_ID)을 확인해주세요.",
-                            )
-                  except Exception:
-                    # 위 블록 어디서든(첨부파일 목록 추출 등, 개별 try로 못 막는 부분 포함)
-                    # 예상 못 한 예외가 나면 예전엔 여기서 그냥 조용히 끝나서 유진님이 폐점서류
-                    # 저장 여부를 전혀 알 수 없었음 - 반드시 실패 알림이 가도록 함.
-                    logger.exception("폐점서류 처리 준비 중 오류")
+                try:
+                    await _sj_handle_cert_file(context.bot, att_filename, att_bytes)
+                except Exception as e:
+                    logger.exception("처브 증명서 처리 중 오류")
                     await _send_message_retrying(
                         context.bot, ALLOWED_USER_ID,
-                        "❌ 폐점서류 처리 중 예상치 못한 오류가 발생해서 구글 드라이브에 저장하지 못했어요. 직접 확인 부탁드려요.",
+                        f"⚠️ 메일 첨부 '{att_filename}' 처리 중 오류: {type(e).__name__}: {str(e)[:150]}",
                     )
 
         last_uid_seen = latest_uid
@@ -4660,18 +5174,11 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("remind", remind))
     app.add_handler(CommandHandler("mail", mail_command))
-    app.add_handler(CommandHandler("testmail", test_mail_command))
     app.add_handler(CommandHandler("route", route_start))
     app.add_handler(CommandHandler("sethome", set_home))
     app.add_handler(CommandHandler("setwork", set_work))
     app.add_handler(CommandHandler("towork", commute_to_work))
     app.add_handler(CommandHandler("tohome", commute_to_home))
-    app.add_handler(CommandHandler("setpolicy", set_policy_command))
-    app.add_handler(CommandHandler("brands", list_brands_command))
-    app.add_handler(CommandHandler("setbrandname", set_brand_name_command))
-    app.add_handler(CommandHandler("sendmaster", send_master_command))
-    app.add_handler(CommandHandler("setbrandalias", set_brand_alias_command))
-    app.add_handler(CommandHandler("setcerttemplate", set_cert_template_command))
     app.add_handler(CommandHandler("setcontact", set_contact_command))
     app.add_handler(CommandHandler("contacts", list_contacts_command))
     app.add_handler(CommandHandler("mutesender", mute_sender_command))
