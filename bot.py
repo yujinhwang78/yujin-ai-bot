@@ -4346,6 +4346,255 @@ async def check_token_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_message_retrying(context.bot, ALLOWED_USER_ID, text)
 
 
+# ---------------------------------------------------------------------------
+# 팜스코 소 가축재해보험 사고접수 자동 기재 (2026-11-12 추가)
+#  - farmscohw@gmail.com 이 보내는 "[보험 접수]" 메일을 주기적으로 읽어서, 구글 드라이브의
+#    「26년 계약리스트.xlsx」(소(240430)/26년) 사고내역 시트 다음 빈 행에 기재함.
+#  - PC가 꺼져 있어도 드라이브의 '같은 파일'을 덮어써서 저장 -> PC가 켜지면 드라이브 동기화로
+#    바탕화면 파일에도 그대로 반영됨. 백업 파일은 만들지 않음(유진님 요청).
+#  - 기재 칸: 날짜(발생일자) / 이력번호 / 농장명 / 증권번호 / 가입금액 / 사고내용(폐사·긴급출하).
+#    사고접수번호·처리경과는 유진님이 직접 입력(기존 방식 유지).
+#  - 중복 방지: 사고내역에 이미 있는 이력번호는 다시 쓰지 않음. 최근 CLAIMS_LOOKBACK_DAYS일
+#    메일을 매번 대조하므로, PC 엑셀에서 저장하다 봇이 쓴 행이 덮여 사라져도 다음 실행 때 다시 채움.
+# ---------------------------------------------------------------------------
+CLAIMS_SENDER = os.environ.get("CLAIMS_SENDER", "farmscohw@gmail.com")
+CLAIMS_XLSX_FILE_ID = os.environ.get("CLAIMS_XLSX_FILE_ID", "1hysBIWklqGKxW5_Un0blQUTpMMct3cXs")
+CLAIMS_CHECK_INTERVAL = int(os.environ.get("CLAIMS_CHECK_INTERVAL", "600"))
+CLAIMS_LOOKBACK_DAYS = int(os.environ.get("CLAIMS_LOOKBACK_DAYS", "7"))
+CLAIMS_SHEET = "사고내역"
+_claims_state: dict = {"last_md5": None, "seen_ids": set()}
+
+
+def _claims_norm_id(v) -> str:
+    """이력번호 비교용 정규화: 숫자만 남기고, 12자리 '002...' 형태면 앞의 '00'을 떼서
+    시트의 10자리 숫자(예: 2214485575)와 맞춤."""
+    d = re.sub(r"\D", "", str(v or ""))
+    if len(d) == 12 and d.startswith("00"):
+        d = d[2:]
+    return d
+
+
+def _claims_fmt_id(v) -> str:
+    """'002 2144 8557 5' 형태로 표기(사고내역 기존 표기와 동일)."""
+    d = re.sub(r"\D", "", str(v or ""))
+    if len(d) == 10:
+        d = "00" + d
+    if len(d) == 12:
+        return f"{d[:3]} {d[3:7]} {d[7:11]} {d[11]}"
+    return str(v or "").strip()
+
+
+def _claims_parse_mail(body: str) -> dict | None:
+    def grab(label):
+        m = re.search(label + r"\s*[:：]\s*(.+?)(?:\s*🐄|\n|$)", body)
+        return m.group(1).strip() if m else ""
+    kind = grab("발생구분")
+    farm = grab("발생농장")
+    animal = grab("개체번호")
+    date_s = grab("발생일자")
+    reason = grab("발생사유")
+    if not animal or not _claims_norm_id(animal):
+        return None
+    m = re.search(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})", date_s)
+    occur = dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+    m2 = re.search(r"\(([^)]+)\)", kind)
+    accident = (m2.group(1) if m2 else kind).strip() or kind
+    return {"kind": kind, "accident": accident, "farm": farm, "animal": animal,
+            "occur": occur, "reason": reason}
+
+
+def _claims_fetch_mails() -> list[dict]:
+    """최근 CLAIMS_LOOKBACK_DAYS일 동안 온 사고접수 메일을 읽어서 파싱해 반환(오래된 순)."""
+    since = (dt.datetime.now(KST) - dt.timedelta(days=CLAIMS_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    out = []
+    try:
+        imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        imap.select("INBOX", readonly=True)  # 읽음 표시를 바꾸지 않음
+        _st, data = imap.uid("search", None, f'(FROM "{CLAIMS_SENDER}" SINCE {since})')
+        for uid in (data[0].split() if data and data[0] else []):
+            _st, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
+            if not msg_data or msg_data[0] is None:
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subject = _decode_mime_words(msg.get("Subject", ""))
+            if "보험 접수" not in subject:
+                continue
+            parsed = _claims_parse_mail(_get_email_body(msg))
+            if parsed:
+                parsed["msg_id"] = msg.get("Message-ID", uid.decode())
+                out.append(parsed)
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+    return out
+
+
+def _claims_lookup(wb, animal_norm: str) -> dict:
+    """개체별 시트들에서 개체를 찾아 농장명·가입금액·농장관리번호를 돌려주고, 농장리스트에서
+    증권번호를 찾음. 사고 표시(폐사/긴급출하)를 남길 셀 위치도 같이 돌려줌."""
+    info = {"farm": None, "amount": None, "mgmt": None, "policy": None, "mark": None}
+    # 1) 4월 갱신 개체별: D=이력번호, K/L=농장관리번호, M=농장명(가입 기준), O=가입금액, U=사고표시
+    if "4월갱신시개체별" in wb.sheetnames:
+        ws = wb["4월갱신시개체별"]
+        for row in ws.iter_rows(min_row=2):
+            if (_claims_norm_id(row[3].value) == animal_norm
+                    and "재가입" in str(row[13].value or "")
+                    and isinstance(row[14].value, (int, float))):
+                # N열이 '재가입(..)'인 개체만 O열이 가입금액임('계약기간지속'은 O열이 다른 값이라
+                # 이 경우엔 월별 추징 시트의 보험가입금액을 씀)
+                info.update(farm=row[12].value or row[4].value, amount=row[14].value,
+                            mgmt=row[11].value, mark=(ws.title, row[20].coordinate))
+                break
+    # 2) 없거나 가입금액이 비어 있으면 월별 추징(신규 가입) 시트: C=이력번호, B=농장, K=농장관리번호, P=가입금액, T=사고표시
+    if info["amount"] in (None, ""):
+        for name in reversed(wb.sheetnames):
+            if "추징" not in name:
+                continue
+            ws = wb[name]
+            hit = None
+            for row in ws.iter_rows(min_row=2):
+                if len(row) > 19 and _claims_norm_id(row[2].value) == animal_norm and isinstance(row[15].value, (int, float)):
+                    hit = row
+                    break
+            if hit is not None:
+                info.update(farm=info["farm"] or hit[1].value, amount=hit[15].value,
+                            mgmt=info["mgmt"] or hit[10].value, mark=(ws.title, hit[19].coordinate))
+                break
+    # 3) 증권번호/농장명: 농장리스트에서 농장관리번호(O열)로 찾음. 같은 관리번호가 여러 개면 농장명까지 맞는 행.
+    if "농장리스트" in wb.sheetnames and info["mgmt"] is not None:
+        cands = []
+        for row in wb["농장리스트"].iter_rows(min_row=4, values_only=True):
+            if len(row) > 14 and row[14] is not None and str(row[14]).strip() == str(info["mgmt"]).strip() and row[8]:
+                cands.append(row)
+        pick = None
+        if len(cands) == 1:
+            pick = cands[0]
+        elif cands:
+            pick = next((c for c in cands if str(c[2]).strip() == str(info["farm"]).strip()), None)
+        if pick:
+            info["policy"] = pick[8]
+            info["farm"] = pick[2] if len(cands) == 1 else info["farm"]
+    return info
+
+
+def _claims_apply(wb, mails: list[dict]) -> list[dict]:
+    """사고내역 시트에 아직 없는 메일 건을 다음 빈 행에 기재. 기재한 건 목록을 반환."""
+    ws = wb[CLAIMS_SHEET]
+    existing = set()
+    total_row = None
+    for r in range(4, ws.max_row + 1):
+        if str(ws.cell(r, 2).value or "").strip() == "지급 보험금":
+            total_row = r
+            break
+        n = _claims_norm_id(ws.cell(r, 3).value)
+        if n:
+            existing.add(n)
+    added = []
+    for m in mails:
+        key = _claims_norm_id(m["animal"])
+        if key in existing:
+            continue
+        target = None
+        last = total_row or ws.max_row + 1
+        for r in range(4, last):
+            if all(ws.cell(r, c).value in (None, "") for c in range(2, 11)):  # A열(처리월 병합 라벨)은 제외
+                target = r
+                break
+        if target is None:
+            m["error"] = "사고내역 시트에 빈 행이 없음(합계행 위에 행을 추가해 주세요)"
+            added.append(m)
+            continue
+        info = _claims_lookup(wb, key)
+        ws.cell(target, 2).value = m["occur"]
+        if target > 4 and ws.cell(target - 1, 2).number_format:
+            ws.cell(target, 2).number_format = ws.cell(target - 1, 2).number_format
+        ws.cell(target, 3).value = _claims_fmt_id(m["animal"])
+        ws.cell(target, 4).value = info["farm"] or m["farm"]
+        ws.cell(target, 5).value = info["policy"]
+        ws.cell(target, 7).value = info["amount"]
+        ws.cell(target, 9).value = m["accident"]
+        if not ws.cell(target, 12).value and ws.cell(target - 1, 12).value:
+            ws.cell(target, 12).value = '="26-"&TEXT(ROW()-3,"000")'
+        if info["mark"]:
+            sh, coord = info["mark"]
+            if wb[sh][coord].value in (None, ""):
+                wb[sh][coord].value = m["accident"]
+        existing.add(key)
+        m.update(row=target, info=info)
+        added.append(m)
+    return added
+
+
+def _claims_run_once() -> list[dict] | None:
+    """한 번 실행. 기재한 건 목록(없으면 []), 드라이브 연결이 안 되면 None."""
+    mails = _claims_fetch_mails()
+    if not mails:
+        return []
+    service = _get_gdrive_service()
+    if service is None:
+        return None
+    meta = service.files().get(fileId=CLAIMS_XLSX_FILE_ID, fields="md5Checksum").execute()
+    new_ids = {m["msg_id"] for m in mails} - _claims_state["seen_ids"]
+    if not new_ids and meta.get("md5Checksum") == _claims_state["last_md5"]:
+        return []  # 새 메일도 없고 파일도 그대로면 다운로드 생략
+    content = _gdrive_download_file(service, CLAIMS_XLSX_FILE_ID)
+    if not content:
+        return None
+    wb = openpyxl.load_workbook(io.BytesIO(content))
+    added = _claims_apply(wb, mails)
+    if any("row" in a for a in added):
+        # 다운로드한 뒤에 다른 곳(PC 엑셀 등)에서 파일이 바뀌었으면 덮어쓰지 않고 다음 차례에 다시 시도
+        now_md5 = service.files().get(fileId=CLAIMS_XLSX_FILE_ID, fields="md5Checksum").execute().get("md5Checksum")
+        if now_md5 != meta.get("md5Checksum"):
+            logger.info("사고접수: 저장 직전 파일이 바뀌어 이번 차례는 건너뜀")
+            return []
+        buf = io.BytesIO()
+        wb.save(buf)
+        res = service.files().update(
+            fileId=CLAIMS_XLSX_FILE_ID,
+            media_body=_gdrive_media(buf.getvalue(), mimetype=_XLSX_MIMETYPE),
+            fields="md5Checksum",
+        ).execute()
+        _claims_state["last_md5"] = res.get("md5Checksum")
+    else:
+        _claims_state["last_md5"] = meta.get("md5Checksum")
+    _claims_state["seen_ids"] |= {m["msg_id"] for m in mails}
+    return added
+
+
+async def check_livestock_claims(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        return
+    try:
+        added = await asyncio.to_thread(_claims_run_once)
+    except Exception as e:
+        logger.exception("사고접수 자동 기재 중 오류")
+        await _send_message_retrying(
+            context.bot, ALLOWED_USER_ID,
+            f"⚠️ 소 사고접수 자동 기재 중 오류: {type(e).__name__}: {str(e)[:150]}",
+        )
+        return
+    if not added:
+        return
+    lines = ["🐄 소 사고접수 → 「26년 계약리스트」 사고내역에 기재했어요(드라이브 원본, PC 켜지면 자동 반영)"]
+    for a in added:
+        if "error" in a:
+            lines.append(f"⚠️ {a['farm']} / {a['animal']}: {a['error']}")
+            continue
+        info = a["info"]
+        occ = a["occur"].strftime("%m.%d") if a["occur"] else "?"
+        amt = f"{info['amount']:,}" if isinstance(info["amount"], (int, float)) else "확인필요"
+        lines.append(
+            f"• {a['row']}행: {info['farm'] or a['farm']} / {_claims_fmt_id(a['animal'])} / {occ} {a['accident']}"
+            f" / 가입금액 {amt} / 증권 {info['policy'] or '확인필요'}"
+        )
+    lines.append("사고접수번호·처리경과는 직접 입력해 주세요.")
+    await _send_message_retrying(context.bot, ALLOWED_USER_ID, "\n".join(lines))
+
+
 async def check_gdrive_health(context: ContextTypes.DEFAULT_TYPE) -> None:
     """매일 아침 구글 드라이브 refresh token이 아직 유효한지 점검하고, 끊겼을 때에만 유진님께
     텔레그램으로 알림(2026-10-21, 6일 주기 갱신 알림 대체). 일시적인 네트워크 오류로 잘못
@@ -5198,6 +5447,12 @@ def main() -> None:
         logger.info("이메일 확인 작업이 등록되었습니다 (%d초 간격).", MAIL_CHECK_INTERVAL)
     else:
         logger.info("GMAIL_ADDRESS/GMAIL_APP_PASSWORD가 없어 이메일 확인 기능은 꺼져 있습니다.")
+
+    if GMAIL_ADDRESS and GMAIL_APP_PASSWORD:
+        app.job_queue.run_repeating(
+            check_livestock_claims, interval=CLAIMS_CHECK_INTERVAL, first=60
+        )
+        logger.info("소 사고접수 자동 기재 작업이 등록되었습니다 (%d초 간격).", CLAIMS_CHECK_INTERVAL)
 
     # 6일 주기 토큰 갱신 알림은 껐음(2026-10-21): 구글 앱을 '프로덕션'으로 게시해서 refresh
     # token이 더 이상 7일마다 만료되지 않음. 대신 매일 아침 드라이브 연결만 점검해서, 끊겼을
