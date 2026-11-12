@@ -4663,31 +4663,101 @@ _SJ_REQUEST_KINDS = ("가입", "해지", "폐점", "배서", "변경", "추가")
 
 def _sj_extract_request_from_text(subject: str, body: str, pdf_texts: list) -> list:
     """엑셀 신청서가 없을 때(PDF 신청서/본문만 있는 경우) 메일 제목·본문·PDF 글자에서
-    매장명과 추가/해지 구분을 Claude로 뽑음. [{store_name, kind}] 반환(못 찾으면 빈 목록)."""
+    매장별 신청 내용을 Claude로 뽑음. [{store_name, kind, fields}] 반환(못 찾으면 빈 목록).
+    fields 키는 통합관리리스트 칸 이름(매장주소, 재고, 보험시작일 등)에 맞춤."""
     system = (
-        "아래는 ㈜세정 담당자가 보낸 보험 변경신청 메일이에요. 신청 대상 매장과 신청 종류를 찾아 "
-        'JSON으로만 답하세요: {"stores": [{"store_name": 매장명, "kind": "추가" 또는 "해지" 또는 "비금액"}]}. '
-        "같은 매장에 해지와 추가가 같이 있으면 두 개로 나눠 적으세요. 가입/추가가입은 추가, 해지/폐점/환급은 해지예요."
+        "아래는 ㈜세정 담당자가 보낸 보험 변경신청 메일과 첨부된 '보험계약 변경 승인신청서' PDF 글자예요"
+        "(PDF 글자 순서는 뒤섞여 있을 수 있어요). 신청 대상 매장별로 아래 JSON으로만 답하세요.\n"
+        '{"stores": [{"store_name": 매장명, "kind": "추가" 또는 "해지" 또는 "비금액", '
+        '"address": 소재지 주소, "warehouse": 창고주소, "stock": 재고자산 금액 숫자, "facility": 시설/비품 금액 숫자, '
+        '"building": 건물 금액 숫자, "area_py": 면적(평) 숫자, "start_date": 변경기간 시작일 "YYYY-MM-DD", '
+        '"end_date": 변경기간 종료일 "YYYY-MM-DD", "effective_date": 유효일 "YYYY-MM-DD", '
+        '"property_refund": 재물 환급보험료 숫자, "liability_refund": 배상 환급보험료 숫자, '
+        '"refund_account": 환급 계좌/위임받는 분 문구}]}\n'
+        "가입/추가가입(소재지 추가)은 추가, 해지/폐점/환급(소재지 제외)은 해지예요. 같은 매장에 해지와 추가가 "
+        "같이 있으면 두 개로 나눠 적으세요. 금액이 '-'면 0, 모르면 null로 두세요."
     )
-    content = f"제목: {subject}\n본문:\n{(body or '')[:3000]}\n\nPDF 내용:\n" + "\n---\n".join(t[:2000] for t in pdf_texts)
+    content = f"제목: {subject}\n본문:\n{(body or '')[:3000]}\n\nPDF 내용:\n" + "\n---\n".join(t[:4000] for t in pdf_texts)
     try:
         resp = client.messages.create(
-            model=MODEL_NAME, max_tokens=500, system=system,
-            messages=[{"role": "user", "content": content[:9000]}],
+            model=MODEL_NAME, max_tokens=1500, system=system,
+            messages=[{"role": "user", "content": content[:14000]}],
         )
         raw = "".join(b.text for b in resp.content if b.type == "text")
         m = re.search(r"\{.*\}", raw, re.S)
         data = json.loads(m.group(0)) if m else {}
-        out = []
-        for st in data.get("stores") or []:
-            name = str(st.get("store_name") or "").strip()
-            kind = st.get("kind") if st.get("kind") in ("추가", "해지", "비금액") else "추가"
-            if name:
-                out.append({"store_name": name, "kind": kind})
-        return out
     except Exception:
         logger.exception("변경신청 메일 내용 읽기 중 오류")
         return []
+    out = []
+    for st in data.get("stores") or []:
+        name = str(st.get("store_name") or "").strip()
+        if not name:
+            continue
+        kind = st.get("kind") if st.get("kind") in ("추가", "해지", "비금액") else "추가"
+        f = {"매장명": name, "매장주소": st.get("address"), "창고주소": st.get("warehouse")}
+        if kind == "추가":
+            f.update({"재고": st.get("stock"), "시설/비품": st.get("facility"), "건물": st.get("building"),
+                      "평수": st.get("area_py"), "보험시작일": st.get("start_date"), "보험종기일": st.get("end_date")})
+        else:
+            f.update({"폐점일": st.get("effective_date") or st.get("start_date"),
+                      "재물부문환급": st.get("property_refund"), "영업부문환급": st.get("liability_refund")})
+            if st.get("refund_account"):
+                f["비고"] = f"환급: {st.get('refund_account')}"
+        out.append({"store_name": name, "kind": kind, "fields": {k: v for k, v in f.items() if v not in (None, "")}})
+    return out
+
+
+def _sj_list_info(wb, store_name: str) -> dict:
+    """최초가입전체리스트에서 매장코드/대표자명/사업자번호/전화번호/주소를 찾아줌(없으면 빈 dict)."""
+    target = _sj_norm(store_name)
+    for n in wb.sheetnames:
+        if "최초가입" not in unicodedata.normalize("NFC", n):
+            continue
+        ws = wb[n]
+        for r in range(4, ws.max_row + 1):
+            if _sj_norm(ws.cell(row=r, column=5).value) == target:
+                g = lambda c: ws.cell(row=r, column=c).value
+                return {k: v for k, v in {"매장코드": g(3), "대표자명": g(6), "사업자번호": g(7),
+                                           "전화번호": g(13), "매장주소": g(14)}.items() if v not in (None, "")}
+    return {}
+
+
+def _sj_write_requests_to_master(items: list, sender_name: str | None) -> list:
+    """신청서가 들어오면 바로 통합관리리스트(드라이브 정산관리 폴더)에 기재(2026-11-12 유진님 요청).
+    나중에 처브 증명서가 오면 같은 줄을 증명서 값으로 갱신함. 결과 문구 목록 반환."""
+    msgs = []
+    items = [i for i in items if i.get("kind") in ("추가", "해지") and i.get("brand")]
+    if not items:
+        return ["ℹ️ 기재할 추가/해지 매장이나 브랜드를 확인하지 못해 통합관리리스트에는 적지 않았어요."]
+    service = _get_gdrive_service()
+    if service is None:
+        return ["❌ 구글 드라이브에 연결되지 않아 통합관리리스트에 적지 못했어요."]
+    root = _sj_find_root(service)
+    master = _sj_find_master(service, root) if root else None
+    if master is None:
+        return ["❌ 드라이브 정산관리 폴더에서 통합관리리스트를 못 찾아 적지 못했어요."]
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(_gdrive_download_file(service, master["id"])), data_only=False)
+        for item in items:
+            info = _sj_list_info(wb, item["store_name"])
+            values = {"접수자": sender_name, "접수일자": dt.datetime.now(KST).date().isoformat()}
+            for k, v in info.items():
+                if item["kind"] == "추가" and k == "매장주소":
+                    continue  # 추가 건 주소는 신청서의 새 소재지를 씀
+                values[k] = v
+            values.update({k: _sj_json_value(v) for k, v in (item.get("fields") or {}).items()})
+            values["매장명"] = item["store_name"]
+            where = _sj_write_master(wb, item["brand"], item["kind"], values, update_match=True)
+            msgs.append(f"✅ {item['kind']} {item['store_name']}: 통합관리리스트 {where}에 적었어요.")
+        out = io.BytesIO()
+        wb.save(out)
+        if not _save_brand_master_to_drive(master["id"], out.getvalue()):
+            return ["❌ 통합관리리스트 저장에 실패했어요."]
+    except Exception as e:
+        logger.exception("신청서 통합관리리스트 기재 중 오류")
+        return [f"❌ 통합관리리스트 기재 실패: {type(e).__name__}: {str(e)[:150]}"]
+    return msgs
 
 
 async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
@@ -4737,10 +4807,12 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
              or _sj_brand_from_text(subject, body, *pdf_texts, *[fn for fn, _ in xlsx + others]))
     if not items:
         found = await asyncio.to_thread(_sj_extract_request_from_text, subject, body, pdf_texts)
-        items = [{"kind": f["kind"], "brand": brand, "store_name": f["store_name"], "fields": {}} for f in found]
+        items = [{"kind": f["kind"], "brand": brand, "store_name": f["store_name"], "fields": f.get("fields") or {}}
+                 for f in found]
     for item in items:
         item["brand"] = item.get("brand") or brand
         _sj_remember_request(item, sender_email, sender_name, subject)
+    list_msgs = await asyncio.to_thread(_sj_write_requests_to_master, items, sender_name)
 
     desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
     attachments = xlsx + others
@@ -4756,8 +4828,8 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
         chat_id=ALLOWED_USER_ID,
         text=(
             f"📨 ㈜세정 변경신청 메일이 왔어요 ({brand or '브랜드 미확인'}, {desc}, 보낸 사람: "
-            f"{sender_name or ''} {sender_email or ''}).\n첨부 {len(attachments)}개({files})를 그대로 붙여서 "
-            f"처브 담당자 4명에게 보낼까요?"
+            f"{sender_name or ''} {sender_email or ''}).\n" + "\n".join(list_msgs) +
+            f"\n\n첨부 {len(attachments)}개({files})를 그대로 붙여서 처브 담당자 4명에게 보낼까요?"
         ),
         reply_markup=_queue_confirm_keyboard(cert_id),
     )
@@ -4914,7 +4986,36 @@ def _sj_extend_lookup_ranges(ws) -> int:
     return fixed
 
 
-def _sj_write_master(wb, brand: str, kind: str, values: dict) -> str:
+# 처브 증명서가 오면 신청서 때 적은 값과 비교해서, 다르면 증명서 기준으로 고치는 칸들
+# (주소는 표기 방식만 달라도 다르게 보여서 비교 대상에서 뺌 - 비어 있을 때만 채움)
+_SJ_CERT_OVERWRITE_KEYS = ("재고", "시설/비품", "건물", "평수", "보험시작일", "보험종기일", "폐점일",
+                           "재물부문환급", "영업부문환급")
+_SJ_STATUS_WAIT = "[증명서 대기]"
+
+
+def _sj_same_value(a, b) -> bool:
+    if a in (None, "") and b in (None, ""):
+        return True
+    da, db = _sj_to_date(a), _sj_to_date(b)
+    if da and db:
+        return da.date() == db.date()
+    try:
+        return abs(float(a or 0) - float(b or 0)) <= 1
+    except (TypeError, ValueError):
+        return _sj_norm(a) == _sj_norm(b)
+
+
+def _sj_fmt(v) -> str:
+    d = _sj_to_date(v)
+    if d:
+        return d.strftime("%Y-%m-%d")
+    if isinstance(v, (int, float)):
+        return f"{v:,.0f}"
+    return str(v) if v not in (None, "") else "(빈칸)"
+
+
+def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool = False,
+                     cert_review: bool = False, changes: list | None = None) -> str:
     """통합관리리스트의 '{브랜드}_추가매장' 또는 '{브랜드}_해지매장' 시트 빈 줄에 기재.
     수식 칸은 건드리지 않고(맨 첫 데이터 줄의 수식을 복사), 이미 값이 들어 있는 칸(종기일 등
     미리 넣어둔 값)도 덮어쓰지 않음. 기재한 위치 설명을 반환."""
@@ -4940,9 +5041,34 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict) -> str:
     _sj_extend_lookup_ranges(ws)
 
     template_row = 4
-    target = template_row
-    while ws.cell(row=target, column=name_col).value not in (None, ""):
-        target += 1
+    target = None
+    if update_match:
+        # 신청서 때 이미 적어둔 같은 매장 줄이 있으면 그 줄을 갱신(중복 줄 방지). 날짜가 둘 다
+        # 있는데 다르면(같은 매장의 다른 건) 새 줄로 봄.
+        date_key = "보험시작일" if want == "추가" else "폐점일"
+        dcol = header.get(date_key)
+        want_d = _sj_to_date(values.get(date_key))
+        name_target = _sj_norm(values.get("매장명"))
+        for r in range(template_row, ws.max_row + 1):
+            if _sj_norm(ws.cell(row=r, column=name_col).value) != name_target:
+                continue
+            cd = _sj_to_date(ws.cell(row=r, column=dcol).value) if dcol else None
+            if want_d is None or cd is None or cd.date() == want_d.date():
+                target = r
+    updating = target is not None
+    if target is None:
+        target = template_row
+        while ws.cell(row=target, column=name_col).value not in (None, ""):
+            target += 1
+
+    if target != template_row and not updating:
+        # 새로 늘어나는 줄도 표 서식(테두리·정렬·숫자서식·행 높이)을 첫 데이터 줄과 똑같이 맞춤
+        if ws.row_dimensions[template_row].height:
+            ws.row_dimensions[target].height = ws.row_dimensions[template_row].height
+        for col in range(1, ws.max_column + 1):
+            tcell, cell = ws.cell(row=template_row, column=col), ws.cell(row=target, column=col)
+            if not isinstance(cell, MergedCell) and not isinstance(tcell, MergedCell) and tcell.has_style:
+                cell._style = copy.copy(tcell._style)
 
     for col in range(1, ws.max_column + 1):
         tcell = ws.cell(row=template_row, column=col)
@@ -4967,15 +5093,45 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict) -> str:
         if isinstance(cell.value, str) and cell.value.startswith("="):
             continue
         # 보험 시작/종기/폐점일은 증명서 날짜가 정답이라, 양식에 미리 적힌 날짜가 있어도 덮어씀
-        if cell.value not in (None, "") and key not in ("보험시작일", "보험종기일", "폐점일"):
+        overwrite = ("보험시작일", "보험종기일", "폐점일") + (_SJ_CERT_OVERWRITE_KEYS if updating else ())
+        if cell.value not in (None, "") and key not in overwrite:
             continue
+        if updating and cert_review and cell.value not in (None, "") and key in _SJ_CERT_OVERWRITE_KEYS:
+            if _sj_same_value(cell.value, values[key]):
+                continue
+            if changes is not None:
+                changes.append(f"{key}: {_sj_fmt(cell.value)} → {_sj_fmt(values[key])}")
         v = values[key]
         if key in ("접수일자", "보험시작일", "보험종기일", "폐점일"):
             v = _sj_to_date(v) or v
             if isinstance(v, dt.datetime):
                 cell.number_format = "yyyy-mm-dd"
+        elif isinstance(v, (int, float)) and cell.is_date:
+            # 양식에 날짜 서식이 걸려 있는 금액 칸(예: 해지매장 재물/영업부문 환급)은 숫자 서식으로 바꿈
+            cell.number_format = "#,##0"
         cell.value = v
-    return f"'{ws.title}' 시트 {target}행"
+    # 진행 상태 표시: '업무상태' 칸(2026-11-12 비고 앞에 추가)이 있으면 거기에, 없으면 비고 끝에 붙임.
+    # 신청서 때 '증명서 대기' -> 증명서 검토 후 '증명서 확인 MM/DD'(고친 게 있으면 '(수정)' 표시)
+    today_md = f"{dt.datetime.now(KST):%m/%d}"
+    status_col = header.get("업무상태")
+    if status_col and not isinstance(ws.cell(row=target, column=status_col), MergedCell):
+        st_cell = ws.cell(row=target, column=status_col)
+        if cert_review:
+            st_cell.value = f"증명서 확인 {today_md}" + (" (수정)" if changes else "")
+        elif not str(st_cell.value or "").startswith("증명서 확인"):
+            st_cell.value = "증명서 대기"
+    else:
+        note_col = header.get("비고")
+        if note_col and not isinstance(ws.cell(row=target, column=note_col), MergedCell):
+            note_cell = ws.cell(row=target, column=note_col)
+            note = str(note_cell.value or "")
+            if cert_review:
+                done = f"[증명서 확인 {today_md}]"
+                note = note.replace(_SJ_STATUS_WAIT, done) if _SJ_STATUS_WAIT in note else f"{note} {done}".strip()
+            elif _SJ_STATUS_WAIT not in note and "[증명서 확인" not in note:
+                note = f"{note} {_SJ_STATUS_WAIT}".strip()
+            note_cell.value = note
+    return f"'{ws.title}' 시트 {target}행" + (" (기존 줄 갱신)" if updating else "")
 
 
 def _sj_build_values(kind: str, cert: dict, req: dict | None) -> dict:
@@ -5093,12 +5249,22 @@ def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None
             values = _sj_build_values(kind, cert, req)
             if code and not values.get("매장코드"):
                 values["매장코드"] = code
-            where = _sj_write_master(wb, brand, kind, values)
+            changes = []
+            where = _sj_write_master(wb, brand, kind, values, update_match=True,
+                                     cert_review=True, changes=changes)
             out = io.BytesIO()
             wb.save(out)
             ok = _save_brand_master_to_drive(master["id"], out.getvalue())
-            list_msg = (f"✅ 통합관리리스트('{master['name']}') {where}에 기재했어요."
-                        if ok else "❌ 통합관리리스트 저장에 실패했어요.")
+            if not ok:
+                list_msg = "❌ 통합관리리스트 저장에 실패했어요."
+            elif "기존 줄" not in where:
+                list_msg = (f"⚠️ 신청서로 적어둔 줄이 없어서 증명서 내용으로 새로 적었어요({where}). "
+                            "신청서가 봇을 거치지 않은 건인지 확인해주세요.")
+            elif changes:
+                list_msg = ("⚠️ 증명서를 검토해보니 신청서 때 적은 내용과 달라서, 증명서 기준으로 고쳤어요"
+                            f"({where}):\n" + "\n".join(f"  - {c}" for c in changes))
+            else:
+                list_msg = f"✅ 증명서를 검토했어요. 신청서 때 적은 내용과 일치해요({where})."
     except Exception as e:
         logger.exception("통합관리리스트 기재 중 오류")
         list_msg = f"❌ 통합관리리스트 기재 실패: {type(e).__name__}: {str(e)[:150]}"
