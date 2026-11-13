@@ -4777,7 +4777,7 @@ def _sj_save_request_files(brand: str | None, request_files: list) -> str:
     if root is None:
         return "❌ 드라이브에서 '정산관리' 폴더를 못 찾아 신청서를 저장하지 못했어요."
     try:
-        month_id = _sj_month_folder(service, root, brand)
+        month_id = _sj_month_folder(service, root, brand, "변경신청서")
         for fn, data in request_files:
             mime = _XLSX_MIMETYPE if fn.lower().endswith(".xlsx") else "application/pdf"
             service.files().create(
@@ -4785,7 +4785,7 @@ def _sj_save_request_files(brand: str | None, request_files: list) -> str:
                 media_body=_gdrive_media(data, mimetype=mime), fields="id",
             ).execute()
         today = dt.datetime.now(KST).date()
-        return f"💾 신청서 {len(request_files)}개를 드라이브 정산관리/{brand}/{today:%y}년 {today.month}월 폴더에 저장했어요."
+        return f"💾 신청서 {len(request_files)}개를 드라이브 정산관리/{brand}/변경신청서/{today:%y}년 {today.month}월 폴더에 저장했어요."
     except Exception as e:
         logger.exception("신청서 드라이브 저장 중 오류")
         return f"❌ 신청서 드라이브 저장 실패: {type(e).__name__}"
@@ -4964,13 +4964,20 @@ def _sj_find_master(service, root_id: str) -> dict | None:
     return None
 
 
-def _sj_month_folder(service, root_id: str, brand: str) -> str:
+def _sj_month_folder(service, root_id: str, brand: str, sub: str | None = None) -> str:
+    """정산관리/브랜드/(종류 폴더)/YY년 M월 폴더 id. 종류 폴더는 유진님이 만들어둔 구조에 맞춤:
+    '변경신청서', '추가가입증명서', '해지변경증명서'(2026-11-13). 없으면 만듦."""
     def _same(target):
         t = _sj_norm(target)
         return lambda name: _sj_norm(name) == t
     brand_id = _gdrive_find_child_folder(service, root_id, _same(brand))
     if brand_id is None:
         brand_id = _gdrive_create_folder(service, root_id, brand)
+    if sub:
+        sub_id = _gdrive_find_child_folder(service, brand_id, _same(sub))
+        if sub_id is None:
+            sub_id = _gdrive_create_folder(service, brand_id, sub)
+        brand_id = sub_id
     today = dt.datetime.now(KST).date()
     month_name = f"{today:%y}년 {today.month}월"
     month_id = _gdrive_find_child_folder(service, brand_id, _same(month_name))
@@ -5252,13 +5259,14 @@ def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None
 
     # PDF 저장
     try:
-        month_id = _sj_month_folder(service, root, brand)
+        sub = "추가가입증명서" if kind == "추가" else "해지변경증명서"
+        month_id = _sj_month_folder(service, root, brand, sub)
         service.files().create(
             body={"name": out_name, "parents": [month_id]},
             media_body=_gdrive_media(pdf_bytes, mimetype="application/pdf"), fields="id",
         ).execute()
         today = dt.datetime.now(KST).date()
-        saved_msg = f"💾 드라이브 정산관리/{brand}/{today:%y}년 {today.month}월 폴더에 '{out_name}'로 저장했어요."
+        saved_msg = f"💾 드라이브 정산관리/{brand}/{sub}/{today:%y}년 {today.month}월 폴더에 '{out_name}'로 저장했어요."
     except Exception as e:
         logger.exception("처브 증명서 드라이브 저장 중 오류")
         saved_msg = f"❌ 드라이브 저장 실패: {type(e).__name__}"
