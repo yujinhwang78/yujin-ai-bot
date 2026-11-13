@@ -2805,33 +2805,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요. 다시 보내주세요.")
         return
     try:
-        if lower.endswith(".xlsx"):
-            handled = await _sj_handle_request_file(context.bot, filename, file_bytes, None, None)
+        if lower.endswith(".xlsx") or _sj_pdf_is_request(_extract_pdf_text(file_bytes)):
+            # 변경신청서(엑셀/PDF)를 직접 올린 경우도 메일과 똑같이 처리(리스트 기재+드라이브 저장+처브 발송 확인)
+            handled = await _sj_process_request(
+                context.bot, [(filename, file_bytes)], filename, "", None, None, source="텔레그램 업로드"
+            )
             if not handled:
                 await update.message.reply_text(
-                    "처브 가입·해지 신청서 양식(추가가입_배서/해지_배서 시트)이 아니라서 처리하지 않았어요."
+                    "처브 가입·해지 신청서 양식이 아니라서 처리하지 않았어요."
                 )
-        elif _sj_pdf_is_request(_extract_pdf_text(file_bytes)):
-            # PDF 변경신청서(2026-11-12부터 신청서는 PDF로 옴)
-            found = await asyncio.to_thread(
-                _sj_extract_request_from_text, filename, "", [_extract_pdf_text(file_bytes)]
-            )
-            brand = _sj_brand_from_text(filename, _extract_pdf_text(file_bytes))
-            items = [{"kind": f["kind"], "brand": brand, "store_name": f["store_name"], "fields": {}} for f in found]
-            for item in items:
-                _sj_remember_request(item, None, None, filename)
-            desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
-            cert_id = _queue_pending_certs(
-                [{"store_name": desc, "out_name": filename, "pdf_bytes": file_bytes}],
-                target_email=", ".join(CHUBB_RECIPIENTS),
-                subject=f"[㈜세정 {brand or ''}] 정산 양식 송부 ({desc})",
-                body=_CHUBB_REQUEST_BODY, label="변경신청서",
-            )
-            await update.message.reply_text(
-                f"📨 변경신청서로 확인했어요({brand or '브랜드 미확인'}, {desc}). 처브 담당자 4명에게 보낼까요?\n"
-                "(사업자등록증·통장사본 등 같이 보낼 서류가 있으면, 메일로 온 원본을 봇이 처리하게 두시는 게 좋아요)",
-                reply_markup=_queue_confirm_keyboard(cert_id),
-            )
         else:
             handled = await _sj_handle_cert_file(context.bot, filename, file_bytes)
             if not handled:
@@ -4777,14 +4759,53 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
             sender_email = m.group(2)
         else:
             sender_email = None
-    xlsx = _extract_xlsx_attachments(msg)
-    others = _extract_non_xlsx_attachments(msg)
-    if not xlsx and not others:
-        return False
+    attachments = _extract_xlsx_attachments(msg) + _extract_non_xlsx_attachments(msg)
+    return await _sj_process_request(bot, attachments, subject, body, sender_email, sender_name,
+                                     source="메일")
 
-    items = []
+
+def _sj_save_request_files(brand: str | None, request_files: list) -> str:
+    """신청서 파일(엑셀/PDF)을 드라이브 정산관리/브랜드/월 폴더에 원래 파일명으로 저장(2026-11-13 요청)."""
+    if not request_files:
+        return "ℹ️ 저장할 신청서 파일이 없어요."
+    if not brand:
+        return "⚠️ 브랜드를 몰라서 신청서를 드라이브에 저장하지 못했어요."
+    service = _get_gdrive_service()
+    if service is None:
+        return "❌ 구글 드라이브에 연결되지 않아 신청서를 저장하지 못했어요."
+    root = _sj_find_root(service)
+    if root is None:
+        return "❌ 드라이브에서 '정산관리' 폴더를 못 찾아 신청서를 저장하지 못했어요."
+    try:
+        month_id = _sj_month_folder(service, root, brand)
+        for fn, data in request_files:
+            mime = _XLSX_MIMETYPE if fn.lower().endswith(".xlsx") else "application/pdf"
+            service.files().create(
+                body={"name": fn, "parents": [month_id]},
+                media_body=_gdrive_media(data, mimetype=mime), fields="id",
+            ).execute()
+        today = dt.datetime.now(KST).date()
+        return f"💾 신청서 {len(request_files)}개를 드라이브 정산관리/{brand}/{today:%y}년 {today.month}월 폴더에 저장했어요."
+    except Exception as e:
+        logger.exception("신청서 드라이브 저장 중 오류")
+        return f"❌ 신청서 드라이브 저장 실패: {type(e).__name__}"
+
+
+async def _sj_process_request(bot, attachments: list, subject: str, body: str,
+                              sender_email: str | None, sender_name: str | None, source: str) -> bool:
+    """변경신청서 처리 공통 흐름(메일로 온 경우, 텔레그램에 직접 올린 경우 둘 다):
+    매장/신청내용 읽기 -> 보낸 사람 기억 -> 통합관리리스트 기재 -> 신청서를 드라이브에 저장 ->
+    처브 4명에게 보낼지 확인 버튼. 신청서가 아니면 False."""
+    if not attachments:
+        return False
+    xlsx = [(fn, d) for fn, d in attachments if fn.lower().endswith(".xlsx")]
+    others = [(fn, d) for fn, d in attachments if not fn.lower().endswith(".xlsx")]
+
+    items, request_files = [], []
     for fn, data in xlsx:
         parsed = _sj_parse_request(data, fn)
+        if parsed is not None:
+            request_files.append((fn, data))
         if parsed:
             items.extend(parsed)
     pdf_texts, has_pdf_request = [], False
@@ -4792,9 +4813,10 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
         if fn.lower().endswith(".pdf"):
             t = _extract_pdf_text(data)
             if _sj_is_chubb_cert_text(t):
-                return False  # 처브 증명서 메일(전달 포함)은 증명서 처리로 넘김
+                return False  # 처브 증명서는 증명서 처리로 넘김
             if _sj_pdf_is_request(t):
                 has_pdf_request = True
+                request_files.append((fn, data))
             pdf_texts.append(t)
     text_all = f"{subject} {body}"
     looks_like_request = (
@@ -4804,7 +4826,7 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
         return False
 
     brand = (next((i.get("brand") for i in items if i.get("brand")), None)
-             or _sj_brand_from_text(subject, body, *pdf_texts, *[fn for fn, _ in xlsx + others]))
+             or _sj_brand_from_text(subject, body, *pdf_texts, *[fn for fn, _ in attachments]))
     if not items:
         found = await asyncio.to_thread(_sj_extract_request_from_text, subject, body, pdf_texts)
         items = [{"kind": f["kind"], "brand": brand, "store_name": f["store_name"], "fields": f.get("fields") or {}}
@@ -4813,9 +4835,9 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
         item["brand"] = item.get("brand") or brand
         _sj_remember_request(item, sender_email, sender_name, subject)
     list_msgs = await asyncio.to_thread(_sj_write_requests_to_master, items, sender_name)
+    save_msg = await asyncio.to_thread(_sj_save_request_files, brand, request_files)
 
     desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
-    attachments = xlsx + others
     cert_id = _queue_pending_certs(
         [{"store_name": desc, "out_name": fn, "pdf_bytes": data} for fn, data in attachments],
         target_email=", ".join(CHUBB_RECIPIENTS),
@@ -4824,11 +4846,12 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
         label="변경신청서",
     )
     files = ", ".join(fn for fn, _ in attachments)
+    who = f"{sender_name or ''} {sender_email or ''}".strip() or "담당자 미확인(증명서가 오면 물어볼게요)"
     await bot.send_message(
         chat_id=ALLOWED_USER_ID,
         text=(
-            f"📨 ㈜세정 변경신청 메일이 왔어요 ({brand or '브랜드 미확인'}, {desc}, 보낸 사람: "
-            f"{sender_name or ''} {sender_email or ''}).\n" + "\n".join(list_msgs) +
+            f"📨 ㈜세정 변경신청서({source}): {brand or '브랜드 미확인'}, {desc}, 보낸 사람: {who}\n"
+            + "\n".join(list_msgs) + "\n" + save_msg +
             f"\n\n첨부 {len(attachments)}개({files})를 그대로 붙여서 처브 담당자 4명에게 보낼까요?"
         ),
         reply_markup=_queue_confirm_keyboard(cert_id),
