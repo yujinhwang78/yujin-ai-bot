@@ -2792,9 +2792,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ㈜세정 x 처브 업무(2026-11-12~): 변경신청서 엑셀 또는 처브 증명서 PDF를 직접 올린 경우.
     # (예전 정산양식 동기화/가입증명서 생성/폐점서류 수집 로직은 껐음)
     lower = filename.lower()
-    if not lower.endswith((".xlsx", ".pdf")):
+    if not lower.endswith((".xlsx",) + _SJ_DOC_EXTS):
         await update.message.reply_text(
-            "㈜세정 변경신청서(엑셀)나 처브 보험가입증명서/배서증명서(PDF)만 처리할 수 있어요."
+            "㈜세정 변경신청서(엑셀/PDF), 처브 증명서(PDF), 해지 서류(사업자등록증·통장사본, PDF/사진)만 처리할 수 있어요."
         )
         return
     try:
@@ -2815,11 +2815,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "처브 가입·해지 신청서 양식이 아니라서 처리하지 않았어요."
                 )
         else:
-            handled = await _sj_handle_cert_file(context.bot, filename, file_bytes)
+            handled = lower.endswith(".pdf") and await _sj_handle_cert_file(context.bot, filename, file_bytes)
             if not handled:
-                await update.message.reply_text(
-                    "처브 보험가입증명서나 배서증명서로 보이지 않아서 처리하지 않았어요."
-                )
+                # 해지 관련 서류(사업자등록증/통장사본 등)면 가장 최근 해지신청 매장 기준으로 저장
+                category = await _classify_closure_doc_deep(filename, file_bytes)
+                if category not in _SJ_CLOSURE_DOC_TYPES:
+                    category = None
+                last = _sj_load(SEJUNG_LAST_CLOSE_FILE, {})
+                recent = False
+                try:
+                    recent = (dt.datetime.now(KST) - dt.datetime.fromisoformat(last.get("at"))).days <= 14
+                except Exception:
+                    pass
+                if category and last.get("stores") and recent:
+                    msg = await _sj_save_closure_docs(last["brand"], last["stores"], [(filename, file_bytes)])
+                    await update.message.reply_text(
+                        (msg or "저장할 서류가 없어요.") +
+                        f"\n(가장 최근 해지신청 매장 기준: {last['brand']} {', '.join(last['stores'])})"
+                    )
+                elif category:
+                    await update.message.reply_text(
+                        f"'{filename}'은 {category}로 보이는데, 어느 매장 건인지 모르겠어요. "
+                        "해지신청서를 먼저 올려주시면 그 매장 이름으로 저장해드릴게요."
+                    )
+                else:
+                    await update.message.reply_text(
+                        "변경신청서, 처브 증명서, 해지 서류(사업자등록증·통장사본) 중 어느 것으로도 보이지 않아서 처리하지 않았어요."
+                    )
     except Exception as e:
         logger.exception("세정 파일 처리 중 오류")
         await update.message.reply_text(f"⚠️ 처리 중 오류가 발생했어요: {type(e).__name__}: {str(e)[:150]}")
@@ -3964,11 +3986,10 @@ async def _run_chat_tool(name: str, tool_input: dict) -> str:
 
 # 폐점필수서류로 인정하는 4종류와, 각각을 파일명에서 알아보는 키워드. 4종류가 전부 매칭돼야
 # '서류가 갖춰졌다'고 보고 압축해서 저장함(유진님이 정해주신 기준).
+# 해지 서류는 사업자등록증·통장사본 2가지만 받음(2026-11-13 유진님: 신분증·개인정보동의서·제3자동의서는 아예 배제)
 _CLOSURE_DOC_KEYWORDS = {
     "사업자등록증": ["사업자등록증"],
-    "신분증": ["주민등록증", "신분증"],
     "통장사본": ["통장사본", "통장"],
-    "개인정보동의서": ["개인정보"],
 }
 
 # 파일명만으로 못 알아본 서류(예: 'OL인천구월점_251112.pdf'처럼 키워드가 전혀 없는 이름)를,
@@ -3977,9 +3998,7 @@ _CLOSURE_DOC_KEYWORDS = {
 # 보여주고 판단시킴(유진님 요청: "파일을 다 열어서 파악해보고 없는 서류를 알려줘").
 _CLOSURE_DOC_CONTENT_HINTS = {
     "사업자등록증": ["사업자등록증", "사업자등록번호", "개업연월일", "법인등록번호"],
-    "신분증": ["주민등록증", "운전면허증", "주민등록번호"],
     "통장사본": ["예금주", "계좌번호", "보통예금", "예금거래통장"],
-    "개인정보동의서": ["개인정보", "동의서"],
 }
 
 
@@ -4019,9 +4038,8 @@ async def _classify_doc_with_claude(filename: str, file_bytes: bytes, mimetype: 
             model=MODEL_NAME,
             max_tokens=20,
             system=(
-                "첨부된 문서 이미지/파일이 '사업자등록증', '신분증'(주민등록증 또는 운전면허증), "
-                "'통장사본'(예금계좌 확인서 포함), '개인정보동의서' 중 어떤 것인지 정확히 그 이름 "
-                "하나만 답하세요. 네 가지 중 어디에도 해당하지 않으면 정확히 NONE이라고만 답하세요. "
+                "첨부된 문서 이미지/파일이 '사업자등록증', '통장사본'(예금계좌 확인서 포함) 중 "
+                "어떤 것인지 정확히 그 이름 하나만 답하세요. 둘 다 아니면 정확히 NONE이라고만 답하세요. "
                 "다른 설명은 절대 하지 마세요."
             ),
             messages=[{
@@ -4764,6 +4782,82 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
                                      source="메일")
 
 
+SEJUNG_LAST_CLOSE_FILE = os.path.join(PERSIST_DIR, "sejung_last_close.json")
+_SJ_DOC_EXTS = (".pdf", ".jpg", ".jpeg", ".png")
+_SJ_CLOSURE_DOC_TYPES = ("사업자등록증", "통장사본")
+
+
+def _sj_upload_closure_docs(brand: str, named_docs: list) -> str:
+    """[(저장할 이름, bytes)]를 정산관리/브랜드/해지변경신청서/YY년 M월 폴더에 저장."""
+    service = _get_gdrive_service()
+    if service is None:
+        return "❌ 구글 드라이브에 연결되지 않아 해지 서류를 저장하지 못했어요."
+    root = _sj_find_root(service)
+    if root is None:
+        return "❌ 드라이브에서 '정산관리' 폴더를 못 찾아 해지 서류를 저장하지 못했어요."
+    try:
+        month_id = _sj_month_folder(service, root, brand, "해지변경신청서")
+        for name, data in named_docs:
+            low = name.lower()
+            mime = ("application/pdf" if low.endswith(".pdf") else
+                    "image/png" if low.endswith(".png") else "image/jpeg")
+            service.files().create(
+                body={"name": name, "parents": [month_id]},
+                media_body=_gdrive_media(data, mimetype=mime), fields="id",
+            ).execute()
+        today = dt.datetime.now(KST).date()
+        return (f"💾 해지 서류 {len(named_docs)}개({', '.join(n for n, _ in named_docs)})를 "
+                f"정산관리/{brand}/해지변경신청서/{today:%y}년 {today.month}월 폴더에 저장했어요.")
+    except Exception as e:
+        logger.exception("해지 서류 드라이브 저장 중 오류")
+        return f"❌ 해지 서류 드라이브 저장 실패: {type(e).__name__}"
+
+
+async def _sj_save_closure_docs(brand: str | None, stores: list, docs: list) -> str | None:
+    """해지 관련 서류(사업자등록증/통장사본)를 '통장사본_OO점.pdf'처럼
+    이름 붙여 해지변경신청서 폴더에 저장(2026-11-13 유진님 요청). 서류가 없으면 None."""
+    if not docs or not stores or not brand:
+        return None
+    named, skipped = [], []
+    used = set()
+    for fn, data in docs:
+        if not fn.lower().endswith(_SJ_DOC_EXTS):
+            continue
+        category = await _classify_closure_doc_deep(fn, data)
+        if category not in _SJ_CLOSURE_DOC_TYPES:
+            skipped.append(fn)
+            continue
+        norm_fn = _sj_norm(fn)
+        store = next((st for st in stores if _sj_norm(st) and _sj_norm(st) in norm_fn), stores[0])
+        ext = os.path.splitext(fn)[1].lower() or ".pdf"
+        name = f"{category}_{store}{ext}"
+        n = 2
+        while name in used:
+            name = f"{category}_{store}_{n}{ext}"
+            n += 1
+        used.add(name)
+        named.append((name, data))
+    return await asyncio.to_thread(_sj_upload_closure_docs, brand, named) if named else None
+
+
+def _sj_request_file_kind(filename: str, data: bytes) -> str:
+    """신청서 파일 하나가 추가인지 해지인지: PDF는 '소재지 제외/Decreased'면 해지, 엑셀은 매장명이
+    적힌 시트로 판단. 애매하면 파일명('해지')을 보고, 그래도 모르면 추가."""
+    if filename.lower().endswith(".xlsx"):
+        items = _sj_parse_request(data, filename) or []
+        if items and all(i["kind"] == "해지" for i in items):
+            return "해지"
+        if items:
+            return "추가"
+    else:
+        t = (_extract_pdf_text(data) or "").replace(" ", "")
+        if "소재지제외" in t or "DecreasedTSI" in t or "ReturnPremium" in t:
+            return "해지"
+        if "소재지추가" in t or "IncreasedTSI" in t:
+            return "추가"
+    return "해지" if "해지" in filename and "가입" not in filename else "추가"
+
+
 def _sj_save_request_files(brand: str | None, request_files: list) -> str:
     """신청서 파일(엑셀/PDF)을 드라이브 정산관리/브랜드/월 폴더에 원래 파일명으로 저장(2026-11-13 요청)."""
     if not request_files:
@@ -4777,15 +4871,19 @@ def _sj_save_request_files(brand: str | None, request_files: list) -> str:
     if root is None:
         return "❌ 드라이브에서 '정산관리' 폴더를 못 찾아 신청서를 저장하지 못했어요."
     try:
-        month_id = _sj_month_folder(service, root, brand, "변경신청서")
+        # 브랜드/추가변경신청서, 브랜드/해지변경신청서 로 나눠 월별 저장(2026-11-13 유진님 요청)
+        today = dt.datetime.now(KST).date()
+        saved = []
         for fn, data in request_files:
+            kind_folder = "해지변경신청서" if _sj_request_file_kind(fn, data) == "해지" else "추가변경신청서"
+            month_id = _sj_month_folder(service, root, brand, kind_folder)
             mime = _XLSX_MIMETYPE if fn.lower().endswith(".xlsx") else "application/pdf"
             service.files().create(
                 body={"name": fn, "parents": [month_id]},
                 media_body=_gdrive_media(data, mimetype=mime), fields="id",
             ).execute()
-        today = dt.datetime.now(KST).date()
-        return f"💾 신청서 {len(request_files)}개를 드라이브 정산관리/{brand}/변경신청서/{today:%y}년 {today.month}월 폴더에 저장했어요."
+            saved.append(f"{kind_folder}/{today:%y}년 {today.month}월")
+        return f"💾 신청서 {len(request_files)}개를 드라이브 정산관리/{brand}/({', '.join(sorted(set(saved)))}) 폴더에 저장했어요."
     except Exception as e:
         logger.exception("신청서 드라이브 저장 중 오류")
         return f"❌ 신청서 드라이브 저장 실패: {type(e).__name__}"
@@ -4836,6 +4934,14 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         _sj_remember_request(item, sender_email, sender_name, subject)
     list_msgs = await asyncio.to_thread(_sj_write_requests_to_master, items, sender_name)
     save_msg = await asyncio.to_thread(_sj_save_request_files, brand, request_files)
+    closing_stores = [i["store_name"] for i in items if i.get("kind") == "해지"]
+    if closing_stores and brand:
+        _sj_save(SEJUNG_LAST_CLOSE_FILE, {"brand": brand, "stores": closing_stores,
+                                          "at": dt.datetime.now(KST).isoformat()})
+        extra_docs = [(fn, d) for fn, d in others if (fn, d) not in request_files]
+        doc_msg = await _sj_save_closure_docs(brand, closing_stores, extra_docs)
+        if doc_msg:
+            save_msg += "\n" + doc_msg
 
     desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
     cert_id = _queue_pending_certs(
@@ -4965,18 +5071,19 @@ def _sj_find_master(service, root_id: str) -> dict | None:
 
 
 def _sj_month_folder(service, root_id: str, brand: str, sub: str | None = None) -> str:
-    """정산관리/브랜드/(종류 폴더)/YY년 M월 폴더 id. 종류 폴더는 유진님이 만들어둔 구조에 맞춤:
-    '변경신청서', '추가가입증명서', '해지변경증명서'(2026-11-13). 없으면 만듦."""
+    """sub는 '변경신청서/추가가입신청서'처럼 '/'로 여러 단계를 줄 수 있음."""
+    """정산관리/브랜드/(종류 폴더)/YY년 M월 폴더 id. 종류 폴더는 유진님이 정한 구조에 맞춤:
+    '추가변경신청서', '해지변경신청서', '추가가입증명서', '해지변경증명서'(2026-11-13). 없으면 만듦."""
     def _same(target):
         t = _sj_norm(target)
         return lambda name: _sj_norm(name) == t
     brand_id = _gdrive_find_child_folder(service, root_id, _same(brand))
     if brand_id is None:
         brand_id = _gdrive_create_folder(service, root_id, brand)
-    if sub:
-        sub_id = _gdrive_find_child_folder(service, brand_id, _same(sub))
+    for part in [p for p in (sub or "").split("/") if p]:
+        sub_id = _gdrive_find_child_folder(service, brand_id, _same(part))
         if sub_id is None:
-            sub_id = _gdrive_create_folder(service, brand_id, sub)
+            sub_id = _gdrive_create_folder(service, brand_id, part)
         brand_id = sub_id
     today = dt.datetime.now(KST).date()
     month_name = f"{today:%y}년 {today.month}월"
