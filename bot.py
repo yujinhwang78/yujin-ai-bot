@@ -287,7 +287,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset - 지금까지의 대화 기억 지우기\n"
         "/setcontact <담당자 이름> <이메일> - ㈜세정 담당자 이메일 등록\n"
         "/contacts - 등록된 담당자 연락처 목록 보기\n"
-        "/pending - 대기 중인(아직 안 보낸) 메일 목록 보기\n\n"
+        "/pending - 대기 중인(아직 안 보낸) 메일 목록 보기\n"
+        "/waiting - 담당자 답을 기다리는 세정 건 보기, /cancelwait 매장명 - 그 대기 취소\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?'처럼 물어보셔도 알아들어요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬 대화 중에 '내 메일에서 ~ 찾아줘'처럼 물어보셔도 돼요.\n"
         "㈜세정 변경신청서(엑셀)가 오면 처브 담당자 4명에게 보낼지 물어보고, 처브 보험가입증명서/배서증명서(PDF)가 "
@@ -5672,6 +5673,56 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: 
     return True
 
 
+async def sejung_waiting_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/waiting - 담당자 답을 기다리는 ㈜세정 건 목록."""
+    if not is_allowed(update):
+        return
+    cert_wait = _sj_load(SEJUNG_AWAIT_FILE, [])
+    recv_wait = _sj_load(SEJUNG_AWAIT_RECEIVER_FILE, [])
+    lines = [f"- [증명서 발송 담당자] {w['brand']} {w['store']}" for w in cert_wait]
+    lines += [f"- [신청서 접수자] {w.get('brand') or ''} " + ", ".join(i["store_name"] for i in w.get("items", []))
+              for w in recv_wait]
+    await update.message.reply_text(
+        ("⏳ 담당자 답을 기다리는 건:\n" + "\n".join(lines) +
+         "\n\n필요 없는 건은 /cancelwait 매장명 으로 취소하세요.") if lines else "대기 중인 건이 없어요."
+    )
+
+
+async def sejung_cancel_wait_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancelwait <매장명> - 담당자 답 대기 건을 취소(직접 메일을 보냈을 때 등). 2026-11-16 요청."""
+    if not is_allowed(update):
+        return
+    target = _sj_norm(" ".join(context.args or []))
+    if not target:
+        await update.message.reply_text("사용법: /cancelwait 매장명 (대기 목록은 /waiting)")
+        return
+    removed = []
+    cert_wait = _sj_load(SEJUNG_AWAIT_FILE, [])
+    keep = []
+    for w in cert_wait:
+        if target in _sj_norm(w.get("store")) or _sj_norm(w.get("store")) in target:
+            removed.append(f"[증명서 발송] {w['store']}")
+            try:
+                os.remove(w["path"])
+            except OSError:
+                pass
+        else:
+            keep.append(w)
+    _sj_save(SEJUNG_AWAIT_FILE, keep)
+    recv_wait = _sj_load(SEJUNG_AWAIT_RECEIVER_FILE, [])
+    keep2 = []
+    for w in recv_wait:
+        names = [i["store_name"] for i in w.get("items", [])]
+        if any(target in _sj_norm(n) or _sj_norm(n) in target for n in names):
+            removed.append(f"[신청서 접수자] {', '.join(names)}")
+        else:
+            keep2.append(w)
+    _sj_save(SEJUNG_AWAIT_RECEIVER_FILE, keep2)
+    await update.message.reply_text(
+        f"🗑 대기 취소했어요: {', '.join(removed)}" if removed else "해당 매장의 대기 건을 찾지 못했어요. /waiting 으로 확인해주세요."
+    )
+
+
 def _sj_name_from_reply(text: str) -> str:
     """'세정 장혜진 님한테 메일 보내줘' 같은 문장에서 담당자 이름만 뽑음. 등록된 연락처 이름이
     문장 안에 있으면 그걸 우선 씀(2026-11-16: 문장 전체를 이름으로 착각하던 문제 수정)."""
@@ -5714,6 +5765,18 @@ async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool
         return False  # 신청서 접수자 질문에 대한 답이면 그쪽 처리로 넘김
     idx = _sj_pick_waiting(update, awaiting, "store")
     item = awaiting[idx]
+    # '직접 보냈어', '안 보내도 돼', '취소' 같은 답이면 발송 대기를 취소(2026-11-16 유진님 요청)
+    if re.search(r"직접\s*보냈|이미\s*보냈|보냈어|보냈습니다|안\s*보내|보내지\s*마|취소|필요\s*없", text):
+        awaiting.pop(idx)
+        _sj_save(SEJUNG_AWAIT_FILE, awaiting)
+        try:
+            os.remove(item["path"])
+        except OSError:
+            pass
+        await update.message.reply_text(f"🗑 '{item['store']}' 증명서 발송 대기를 취소했어요(직접 보내신 걸로 처리).")
+        if awaiting:
+            await update.message.reply_text(f"남은 대기 건: {', '.join(w['store'] for w in awaiting)}")
+        return True
     email_match = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text)
     target, who = None, text
     if email_match:
@@ -5872,6 +5935,8 @@ def main() -> None:
     app.add_handler(CommandHandler("unmutesender", unmute_sender_command))
     app.add_handler(CommandHandler("mutedsenders", list_muted_senders_command))
     app.add_handler(CommandHandler("pending", list_pending_command))
+    app.add_handler(CommandHandler("waiting", sejung_waiting_command))
+    app.add_handler(CommandHandler("cancelwait", sejung_cancel_wait_command))
     app.add_handler(CallbackQueryHandler(handle_cert_confirmation))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
