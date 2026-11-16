@@ -4447,11 +4447,17 @@ _CHUBB_REQUEST_BODY = (
 )
 
 
-def _sejung_cert_body(kind: str) -> str:
+def _sejung_cert_body(kind: str, refund_date: str | None = None) -> str:
     what = "추가매장의 보험가입증명서를" if kind == "추가" else "해지매장의 변경증서(환급)를"
+    # 해지 건은 처브 메일에 적힌 환급 지급 예정일을 같이 안내(2026-11-16 유진님 요청)
+    refund_line = ""
+    if kind != "추가" and refund_date:
+        mo, d = refund_date.split("/")
+        refund_line = f"환급보험료는 {int(mo)}월 {int(d)}일에 지급될 예정입니다.\n"
     return (
         "안녕하십니까~\n"
         f"보내주신 {what} 보내드립니다.\n"
+        + refund_line +
         "업무에 참고하여 주시기 바랍니다.\n\n"
         "즐거운 하루 보내십시요\n"
         "감사합니다.\n"
@@ -5362,6 +5368,15 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
             # 양식에 날짜 서식이 걸려 있는 금액 칸(예: 해지매장 재물/영업부문 환급)은 숫자 서식으로 바꿈
             cell.number_format = "#,##0"
         cell.value = v
+    # 비고 끝에 덧붙일 내용(예: 처브 메일의 '환급날짜: 11/18')
+    extra_note = values.get("_비고추가")
+    note_col_x = header.get("비고")
+    if extra_note and note_col_x and not isinstance(ws.cell(row=target, column=note_col_x), MergedCell):
+        nc = ws.cell(row=target, column=note_col_x)
+        cur = str(nc.value or "")
+        if extra_note not in cur:
+            nc.value = f"{cur} / {extra_note}" if cur else extra_note
+
     # 순번: 수식이 없는 시트(해지매장)는 줄 번호를 직접 적음(추가매장은 =ROW() 수식이 알아서 계산)
     seq_col = header.get("순번")
     if seq_col:
@@ -5462,7 +5477,7 @@ def _sj_cert_filename(code: str | None, store: str, kind: str, cert: dict, req: 
 
 
 def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None,
-                              filename: str, pdf_bytes: bytes) -> tuple[str, str, str]:
+                              filename: str, pdf_bytes: bytes, refund_date: str | None = None) -> tuple[str, str, str]:
     """(통합리스트 기재 결과 문구, PDF 저장 결과 문구, 저장 파일명) 반환. 실패하면 오류 문구를 담음."""
     store = (req or {}).get("store_name") or str(cert.get("store_name") or "").strip()
     req_code = ((req or {}).get("fields") or {}).get("매장코드")
@@ -5513,6 +5528,8 @@ def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None
             if code and not values.get("매장코드"):
                 values["매장코드"] = code
             changes = []
+            if refund_date:
+                values["_비고추가"] = f"환급날짜: {refund_date}"
             where = _sj_write_master(wb, brand, kind, values, update_match=True,
                                      cert_review=True, changes=changes)
             out = io.BytesIO()
@@ -5535,13 +5552,13 @@ def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None
 
 
 async def _sj_queue_to_sejung(bot, target_email: str, store: str, kind: str, brand: str,
-                              filename: str, pdf_bytes: bytes, who: str) -> None:
+                              filename: str, pdf_bytes: bytes, who: str, refund_date: str | None = None) -> None:
     label = "보험가입증명서" if kind == "추가" else "변경증서(환급)"
     cert_id = _queue_pending_certs(
         [{"store_name": store, "out_name": filename, "pdf_bytes": pdf_bytes}],
         target_email=target_email,
         subject=f"[㈜세정 {brand}] {store} {label}",
-        body=_sejung_cert_body(kind),
+        body=_sejung_cert_body(kind, refund_date),
         label=label,
     )
     await bot.send_message(
@@ -5551,7 +5568,23 @@ async def _sj_queue_to_sejung(bot, target_email: str, store: str, kind: str, bra
     )
 
 
-async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes) -> bool:
+def _sj_refund_date_from_text(text: str) -> str | None:
+    """처브 메일 본문에서 환급 지급 예정일을 찾아 'MM/DD'로 반환(예: '환급은 11/18 오후 6시경 지급'
+    -> '11/18', '11월 18일 환급' -> '11/18'). 못 찾으면 None. (2026-11-16 유진님 요청)"""
+    if not text or "환급" not in text:
+        return None
+    for line in re.split(r"[\n.]", text):
+        if "환급" not in line:
+            continue
+        m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})", line) or re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", line)
+        if m:
+            mo, d = int(m.group(1)), int(m.group(2))
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                return f"{mo:02d}/{d:02d}"
+    return None
+
+
+async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: str = "") -> bool:
     """처브 보험가입증명서/배서증명서 PDF면 리스트 기재 + 드라이브 저장 + 세정 담당자 발송 준비.
     처리했으면 True(증명서가 아니면 False)."""
     text = _extract_pdf_text(pdf_bytes)
@@ -5584,10 +5617,11 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes) -> bool:
         return True
     kind = cert["kind"]
     store = str(cert["store_name"]).strip()
+    refund_date = _sj_refund_date_from_text(mail_body) if kind == "해지" else None
     req = _sj_find_request(brand, store)
 
     list_msg, saved_msg, out_name = await asyncio.to_thread(
-        _sj_record_cert_to_drive, brand, kind, cert, req, filename, pdf_bytes
+        _sj_record_cert_to_drive, brand, kind, cert, req, filename, pdf_bytes, refund_date,
     )
     filename = out_name  # 세정 담당자에게 보내는 첨부파일 이름도 같은 형식으로
     kind_label = "추가매장 보험가입증명서" if kind == "추가" else "해지매장 변경증서(환급)"
@@ -5601,7 +5635,7 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes) -> bool:
     target = (req or {}).get("sender_email")
     if target:
         await _sj_queue_to_sejung(bot, target, store, kind, brand, filename, pdf_bytes,
-                                  (req or {}).get("sender_name") or target)
+                                  (req or {}).get("sender_name") or target, refund_date)
     else:
         # 담당자를 모르면 유진님께 물어봄 - 답장(이름 또는 이메일)을 받으면 그때 발송 준비
         os.makedirs(SEJUNG_AWAIT_DIR, exist_ok=True)
@@ -5609,7 +5643,8 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes) -> bool:
         with open(path, "wb") as f:
             f.write(pdf_bytes)
         awaiting = _sj_load(SEJUNG_AWAIT_FILE, [])
-        awaiting.append({"store": store, "kind": kind, "brand": brand, "filename": filename, "path": path})
+        awaiting.append({"store": store, "kind": kind, "brand": brand, "filename": filename, "path": path,
+                         "refund_date": refund_date})
         _sj_save(SEJUNG_AWAIT_FILE, awaiting)
         await _send_message_retrying(
             bot, ALLOWED_USER_ID,
@@ -5659,7 +5694,7 @@ async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool
     except OSError:
         pass
     await _sj_queue_to_sejung(update.get_bot(), target, item["store"], item["kind"], item["brand"],
-                              item["filename"], pdf_bytes, who)
+                              item["filename"], pdf_bytes, who, item.get("refund_date"))
     if awaiting:
         await update.message.reply_text(f"다음으로 '{awaiting[0]['store']}' 담당자도 알려주세요.")
     return True
@@ -5753,7 +5788,7 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if not att_filename.lower().endswith(".pdf"):
                     continue
                 try:
-                    await _sj_handle_cert_file(context.bot, att_filename, att_bytes)
+                    await _sj_handle_cert_file(context.bot, att_filename, att_bytes, _get_email_body(msg))
                 except Exception as e:
                     logger.exception("처브 증명서 처리 중 오류")
                     await _send_message_retrying(
