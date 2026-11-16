@@ -4836,11 +4836,21 @@ async def _sj_handle_receiver_reply(update: Update, user_text: str) -> bool:
     """텔레그램으로 올린 신청서의 담당자 이름을 물어본 상태에서 받은 답을 처리."""
     waiting = _sj_load(SEJUNG_AWAIT_RECEIVER_FILE, [])
     text = (user_text or "").strip()
-    if not waiting or not text or text.startswith("/") or len(text) > 20:
+    if not waiting or not text or text.startswith("/") or len(text) > 30:
         return False
-    entry = waiting.pop(0)
+    reply_to = getattr(update.message, "reply_to_message", None)
+    reply_text = getattr(reply_to, "text", "") or "" if reply_to is not None else ""
+    if reply_to is not None and "접수자" not in reply_text:
+        return False  # 다른 질문(증명서 보낼 담당자 등)에 대한 답이면 그쪽 처리로 넘김
+    if reply_to is None and _sj_load(SEJUNG_AWAIT_FILE, []):
+        # 두 종류 질문이 동시에 대기 중인데 답장 지정이 없으면, 문장 속 매장명으로 판단
+        n = _sj_norm(text)
+        if not any(_sj_norm(it["store_name"]) in n for w in waiting for it in w.get("items", [])):
+            return False
+    idx = _sj_pick_waiting(update, waiting, "items")
+    entry = waiting.pop(idx)
     _sj_save(SEJUNG_AWAIT_RECEIVER_FILE, waiting)
-    name = text
+    name = _sj_name_from_reply(text)
     email_addr = _load_contacts().get(_norm_contact_name(name))
     if email_addr and _is_own_address(email_addr):
         email_addr = None
@@ -4994,7 +5004,15 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
                 request_files.append((fn, data))
             pdf_texts.append(t)
     text_all = f"{subject} {body}"
-    looks_like_request = (
+    # 제목/본문만으로 신청 메일로 볼 때는 반드시 ㈜세정 건이라는 표시가 있어야 함(세정 메일 주소,
+    # 브랜드명/증권번호, '세정' 글자). 예전엔 '요청'+'가입' 같은 단어만 보고 다른 거래처 메일
+    # (예: 파블로항공 드론보험 견적요청)까지 세정 신청으로 잘못 처리했음(2026-11-16).
+    is_sejung = (
+        "sejung" in (sender_email or "").lower()
+        or "세정" in text_all
+        or _sj_brand_from_text(text_all) is not None
+    )
+    looks_like_request = is_sejung and (
         any(w in text_all for w in _SJ_REQUEST_WORDS) and any(k in text_all for k in _SJ_REQUEST_KINDS)
     )
     if not items and not has_pdf_request and not looks_like_request:
@@ -5654,6 +5672,35 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: 
     return True
 
 
+def _sj_name_from_reply(text: str) -> str:
+    """'세정 장혜진 님한테 메일 보내줘' 같은 문장에서 담당자 이름만 뽑음. 등록된 연락처 이름이
+    문장 안에 있으면 그걸 우선 씀(2026-11-16: 문장 전체를 이름으로 착각하던 문제 수정)."""
+    t = (text or "").strip()
+    for name in sorted(_load_contacts().keys(), key=len, reverse=True):
+        if name and name in t.replace(" ", ""):
+            return name
+    t = re.sub(r"(㈜|\(주\))?\s*세정", " ", t)
+    t = re.sub(r"(담당자|대리|과장|차장|부장|팀장|주임|사원|대표|님|씨)", " ", t)
+    t = re.sub(r"(한테|에게|께|으로|로)?\s*(이?메일|메일로)?\s*(보내\S*|전달\S*|부탁\S*)", " ", t)
+    words = re.findall(r"[가-힣]{2,4}", t)
+    return words[0] if words else (text or "").strip()
+
+
+def _sj_pick_waiting(update: Update, waiting: list, key: str) -> int:
+    """대기 목록 중 이번 답이 어느 건에 대한 것인지 고름: 유진님이 '답장'한 봇 메시지에 적힌 매장명
+    -> 답 문장에 있는 매장명 -> 가장 오래된 건 순. (2026-11-16: 이천직영점 질문에 답했는데 맨 앞의
+    롯데동부산아울렛점 건으로 처리되던 문제 수정)"""
+    reply_to = getattr(update.message, "reply_to_message", None)
+    sources = [getattr(reply_to, "text", "") or "", getattr(update.message, "text", "") or ""]
+    for src in sources:
+        n = _sj_norm(src)
+        for i, w in enumerate(waiting):
+            stores = [w.get(key)] if isinstance(w.get(key), str) else [x.get("store_name") for x in w.get("items", [])]
+            if any(st and _sj_norm(st) in n for st in stores):
+                return i
+    return 0
+
+
 async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool:
     """담당자를 물어본 상태에서 유진님이 보낸 답(이름 또는 이메일)을 처리. 처리했으면 True."""
     awaiting = _sj_load(SEJUNG_AWAIT_FILE, [])
@@ -5662,19 +5709,24 @@ async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool
     text = user_text.strip()
     if text.startswith("/"):
         return False
-    item = awaiting[0]
+    reply_to = getattr(update.message, "reply_to_message", None)
+    if reply_to is not None and "접수자" in (getattr(reply_to, "text", "") or ""):
+        return False  # 신청서 접수자 질문에 대한 답이면 그쪽 처리로 넘김
+    idx = _sj_pick_waiting(update, awaiting, "store")
+    item = awaiting[idx]
     email_match = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text)
     target, who = None, text
     if email_match:
         target = email_match.group(0)
     else:
+        who = _sj_name_from_reply(text)
         contacts = _load_contacts()
-        target = contacts.get(_norm_contact_name(text))
+        target = contacts.get(_norm_contact_name(who))
         if target and _is_own_address(target):
             target = None
     if not target:
         await update.message.reply_text(
-            f"'{text}' 담당자의 이메일이 등록돼 있지 않아요. 이메일 주소를 그대로 보내주시거나, "
+            f"'{who}' 담당자의 이메일이 등록돼 있지 않아요. 이메일 주소를 그대로 보내주시거나, "
             "/setcontact 이름 이메일 로 등록한 뒤 이름을 다시 보내주세요. "
             f"(대기 중인 건: {item['store']})"
         )
@@ -5683,11 +5735,11 @@ async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool
         with open(item["path"], "rb") as f:
             pdf_bytes = f.read()
     except OSError:
-        awaiting.pop(0)
+        awaiting.pop(idx)
         _sj_save(SEJUNG_AWAIT_FILE, awaiting)
         await update.message.reply_text("⚠️ 대기 중이던 증명서 파일을 찾지 못했어요. 처브 메일에서 직접 보내주세요.")
         return True
-    awaiting.pop(0)
+    awaiting.pop(idx)
     _sj_save(SEJUNG_AWAIT_FILE, awaiting)
     try:
         os.remove(item["path"])
