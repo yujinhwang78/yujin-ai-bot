@@ -3714,6 +3714,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # 문장으로 재발급을 요청한 경우를 감지해서 처리
     # 처브 증명서를 보낼 세정 담당자를 물어본 상태면, 이 답장(이름/이메일)으로 발송 준비
     # (예전 '가입증명서 찾아줘'/'담당자한테 보내줘' 기능은 2026-11-12 처브 전환으로 껐음)
+    if await _sj_handle_receiver_reply(update, user_text):
+        return
     if await _sj_handle_await_contact_reply(update, user_text):
         return
 
@@ -4783,6 +4785,75 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
 
 
 SEJUNG_LAST_CLOSE_FILE = os.path.join(PERSIST_DIR, "sejung_last_close.json")
+SEJUNG_AWAIT_RECEIVER_FILE = os.path.join(PERSIST_DIR, "sejung_await_receiver.json")
+
+
+def _sj_set_receiver_in_master(brand: str, items: list, name: str) -> str:
+    """통합관리리스트에서 해당 매장 줄(가장 아래 줄)의 접수자 칸에 이름을 적음."""
+    service = _get_gdrive_service()
+    root = _sj_find_root(service) if service else None
+    master = _sj_find_master(service, root) if root else None
+    if master is None:
+        return "❌ 통합관리리스트를 못 찾아 접수자를 적지 못했어요."
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(_gdrive_download_file(service, master["id"])), data_only=False)
+        done = []
+        for it in items:
+            want = "추가" if it["kind"] == "추가" else "해지"
+            ws = next((wb[n] for n in wb.sheetnames
+                       if brand and brand in unicodedata.normalize("NFC", n) and want in n), None)
+            if ws is None:
+                continue
+            hdr = {}
+            for c in range(1, ws.max_column + 1):
+                lab = ws.cell(row=3, column=c).value or ws.cell(row=2, column=c).value
+                if lab not in (None, ""):
+                    hdr.setdefault(_norm_header(lab), c)
+            ncol, rcol = hdr.get("매장명"), hdr.get("접수자")
+            if not (ncol and rcol):
+                continue
+            rows = [r for r in range(4, ws.max_row + 1) if _sj_norm(ws.cell(row=r, column=ncol).value) == _sj_norm(it["store_name"])]
+            if rows and not isinstance(ws.cell(row=rows[-1], column=rcol), MergedCell):
+                ws.cell(row=rows[-1], column=rcol).value = name
+                done.append(f"{want} {it['store_name']}")
+        out = io.BytesIO()
+        wb.save(out)
+        if not _save_brand_master_to_drive(master["id"], out.getvalue()):
+            return "❌ 통합관리리스트 저장에 실패했어요."
+        return f"✅ 통합관리리스트 접수자 칸에 {name} 이름을 적었어요({', '.join(done) or '해당 줄 없음'})."
+    except Exception as e:
+        logger.exception("접수자 기재 중 오류")
+        return f"❌ 접수자 기재 실패: {type(e).__name__}"
+
+
+async def _sj_handle_receiver_reply(update: Update, user_text: str) -> bool:
+    """텔레그램으로 올린 신청서의 담당자 이름을 물어본 상태에서 받은 답을 처리."""
+    waiting = _sj_load(SEJUNG_AWAIT_RECEIVER_FILE, [])
+    text = (user_text or "").strip()
+    if not waiting or not text or text.startswith("/") or len(text) > 20:
+        return False
+    entry = waiting.pop(0)
+    _sj_save(SEJUNG_AWAIT_RECEIVER_FILE, waiting)
+    name = text
+    email_addr = _load_contacts().get(_norm_contact_name(name))
+    if email_addr and _is_own_address(email_addr):
+        email_addr = None
+    # 나중에 처브 증명서가 오면 이 담당자에게 보내도록 기억해둔 신청 기록도 갱신
+    requests = _sj_load(SEJUNG_REQUESTS_FILE, {})
+    for it in entry["items"]:
+        key = f"{entry.get('brand') or ''}|{_sj_norm(it['store_name'])}"
+        if key in requests:
+            requests[key]["sender_name"] = name
+            if email_addr:
+                requests[key]["sender_email"] = email_addr
+    _sj_save(SEJUNG_REQUESTS_FILE, requests)
+    msg = await asyncio.to_thread(_sj_set_receiver_in_master, entry.get("brand"), entry["items"], name)
+    tail = (f"증명서가 오면 {name}({email_addr})님께 보낼게요." if email_addr else
+            f"{name}님 이메일이 등록돼 있지 않아요. /setcontact {name} 이메일 로 등록해두시면 증명서가 왔을 때 바로 보낼 수 있어요.")
+    await update.message.reply_text(f"{msg}\n{tail}")
+    if waiting:
+        await update.message.reply_text("다음 신청서의 담당자도 알려주세요.")
+    return True
 _SJ_DOC_EXTS = (".pdf", ".jpg", ".jpeg", ".png")
 _SJ_CLOSURE_DOC_TYPES = ("사업자등록증", "통장사본")
 
@@ -4952,7 +5023,12 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         label="변경신청서",
     )
     files = ", ".join(fn for fn, _ in attachments)
-    who = f"{sender_name or ''} {sender_email or ''}".strip() or "담당자 미확인(증명서가 오면 물어볼게요)"
+    who = f"{sender_name or ''} {sender_email or ''}".strip() or "담당자 미확인"
+    if not sender_email and not sender_name and items:
+        # 텔레그램으로 직접 올린 신청서는 담당자(접수자)를 모르니 유진님께 물어봄(2026-11-16 요청)
+        waiting = _sj_load(SEJUNG_AWAIT_RECEIVER_FILE, [])
+        waiting.append({"brand": brand, "items": [{"kind": i["kind"], "store_name": i["store_name"]} for i in items]})
+        _sj_save(SEJUNG_AWAIT_RECEIVER_FILE, waiting)
     await bot.send_message(
         chat_id=ALLOWED_USER_ID,
         text=(
@@ -4962,6 +5038,11 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         ),
         reply_markup=_queue_confirm_keyboard(cert_id),
     )
+    if not sender_email and not sender_name and items:
+        await bot.send_message(
+            chat_id=ALLOWED_USER_ID,
+            text=f"❓ '{desc}' 신청서의 ㈜세정 담당자(접수자)가 누구예요? 이름을 보내주세요(예: 김가진).",
+        )
     return True
 
 
@@ -5151,6 +5232,40 @@ def _sj_fmt(v) -> str:
     return str(v) if v not in (None, "") else "(빈칸)"
 
 
+def _sj_rebuild_month_column(ws, header: dict, first_row: int = 4) -> None:
+    """'월별' 칸(A열)에 접수일자 기준 'YY년 M월'을 적고, 같은 달 줄끼리 세로로 병합함
+    (2026-11-16 유진님 요청: 그달 들어온 건은 그달로 묶어서 월 표시). 매번 다시 계산함."""
+    mcol = header.get("월별")
+    ncol = header.get("매장명")
+    dcol = header.get("접수일자")
+    if not (mcol and ncol):
+        return
+    for m in list(ws.merged_cells.ranges):
+        if m.min_col == mcol and m.max_col == mcol and m.min_row >= first_row:
+            ws.unmerge_cells(str(m))
+    last = first_row - 1
+    for r in range(first_row, ws.max_row + 1):
+        if ws.cell(row=r, column=ncol).value not in (None, ""):
+            last = r
+    labels = []
+    for r in range(first_row, last + 1):
+        d = _sj_to_date(ws.cell(row=r, column=dcol).value) if dcol else None
+        has = ws.cell(row=r, column=ncol).value not in (None, "")
+        labels.append(f"{d:%y}년 {d.month}월" if (has and d) else None)
+        ws.cell(row=r, column=mcol).value = None
+    r = first_row
+    while r <= last:
+        lab = labels[r - first_row]
+        end = r
+        while end + 1 <= last and labels[end + 1 - first_row] == lab:
+            end += 1
+        if lab:
+            ws.cell(row=r, column=mcol).value = lab
+            if end > r:
+                ws.merge_cells(start_row=r, start_column=mcol, end_row=end, end_column=mcol)
+        r = end + 1
+
+
 def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool = False,
                      cert_review: bool = False, changes: list | None = None) -> str:
     """통합관리리스트의 '{브랜드}_추가매장' 또는 '{브랜드}_해지매장' 시트 빈 줄에 기재.
@@ -5247,6 +5362,14 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
             # 양식에 날짜 서식이 걸려 있는 금액 칸(예: 해지매장 재물/영업부문 환급)은 숫자 서식으로 바꿈
             cell.number_format = "#,##0"
         cell.value = v
+    # 순번: 수식이 없는 시트(해지매장)는 줄 번호를 직접 적음(추가매장은 =ROW() 수식이 알아서 계산)
+    seq_col = header.get("순번")
+    if seq_col:
+        seq_cell = ws.cell(row=target, column=seq_col)
+        if not isinstance(seq_cell, MergedCell) and not (isinstance(seq_cell.value, str) and str(seq_cell.value).startswith("=")):
+            seq_cell.value = target - template_row + 1
+    _sj_rebuild_month_column(ws, header, template_row)
+
     # 진행 상태 표시: '업무상태' 칸(2026-11-12 비고 앞에 추가)이 있으면 거기에, 없으면 비고 끝에 붙임.
     # 신청서 때 '증명서 대기' -> 증명서 검토 후 '증명서 확인 MM/DD'(고친 게 있으면 '(수정)' 표시)
     today_md = f"{dt.datetime.now(KST):%m/%d}"
