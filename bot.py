@@ -291,7 +291,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/waiting - 담당자 답을 기다리는 세정 건 보기, /cancelwait 매장명 - 그 대기 취소\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?'처럼 물어보셔도 알아들어요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬 대화 중에 '내 메일에서 ~ 찾아줘'처럼 물어보셔도 돼요.\n"
-        "㈜세정 변경신청서(엑셀)가 오면 처브 담당자 4명에게 보낼지 물어보고, 처브 보험가입증명서/배서증명서(PDF)가 "
+        "㈜세정 변경신청서(엑셀)가 오면 처브 담당자들에게 보낼지 물어보고, 처브 보험가입증명서/배서증명서(PDF)가 "
         "오면 통합관리리스트에 적고 드라이브 정산관리 폴더에 저장한 뒤 세정 담당자에게 보낼지 물어봐요.\n"
         "날씨, 최신 뉴스, 맛집 등도 그냥 물어보시면 웹 검색해서 답해드려요.\n"
         "📎(첨부) 버튼으로 '위치'를 공유해주시면, 그 위치 기준으로 근처 맛집도 찾아드려요.\n\n"
@@ -1739,12 +1739,31 @@ async def set_policy_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"✅ '{brand}' 브랜드의 증권번호를 등록했어요: {policy_no}")
 
 
+# ㈜세정·OVLR 담당자 기본 연락처(2026-11-16 유진님이 알려주심). 서버에 저장된 연락처(/setcontact)가
+# 있으면 그쪽이 우선이고, 없는 사람만 여기서 채움 - 재배포/저장공간 초기화와 상관없이 항상 쓸 수 있게.
+_DEFAULT_CONTACTS = {
+    "김가진": "kgj15@sejung.co.kr",
+    "김연희": "yhkim@sejung.co.kr",
+    "안해인": "hian01@sejung.co.kr",
+    "서석란": "srseo@sejung.co.kr",
+    "정은주": "ejjung01@ovlr.ai",
+    "김영란": "yrkim01@ovlr.ai",
+    "김훈영": "hykim@ovlr.ai",
+    "배순민": "smbae@sejung.co.kr",
+    "박재용": "jypark@sejung.co.kr",
+    "장혜진": "hjhang@sejung.co.kr",
+}
+
+
 def _load_contacts() -> dict:
     try:
         with open(CONTACTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            saved = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        saved = {}
+    merged = {_norm_contact_name(k): v for k, v in _DEFAULT_CONTACTS.items()}
+    merged.update(saved)
+    return merged
 
 
 def _save_contacts(contacts: dict) -> None:
@@ -4428,6 +4447,7 @@ CHUBB_RECIPIENTS = [
     "Ha-Na.Kim@Chubb.com",
     "Chang-Ha.Lee@Chubb.com",
     "Won.jang@Chubb.com",
+    "Ji-Hyun.Lee@chubb.com",  # 이지현 (2026-11-16 추가)
 ]
 SEJUNG_BRANDS = ("웰메이드", "올리비아로렌", "트레몰로")
 SEJUNG_POLICY_BRAND = {"310D260840": "웰메이드", "310D260841": "올리비아로렌", "310D260842": "트레몰로"}
@@ -4439,17 +4459,48 @@ SEJUNG_AWAIT_DIR = os.path.join(PERSIST_DIR, "sejung_await_files")
 # 드라이브 '정산관리' 폴더 id. 비워두면 이름('정산관리', 상위 폴더 '26년')으로 찾음.
 SEJUNG_FOLDER_ID = os.environ.get("SEJUNG_FOLDER_ID")
 
-_CHUBB_REQUEST_BODY = (
-    "안녕하세요\n"
-    "㈜세정 정산 양식 보내드립니다.\n"
-    "진행 부탁드리고, 서류 보내주시면 감사하겠습니다.\n"
-    "수고하세요\n\n"
-    "--\n" + _CERT_EMAIL_SIGNATURE
-)
+def _chubb_request_body(items: list, brand: str | None = None) -> str:
+    """처브에 보내는 신청 메일 본문. 추가/해지/둘 다에 맞게 문구와 매장 목록을 바꿈(2026-11-16 요청)."""
+    adds = [i["store_name"] for i in items if i.get("kind") == "추가"]
+    dels = [i["store_name"] for i in items if i.get("kind") == "해지"]
+    if adds and dels:
+        what = "추가가입 및 해지"
+    elif adds:
+        what = "추가가입"
+    elif dels:
+        what = "해지"
+    else:
+        what = "변경"
+    lines = []
+    if adds:
+        lines.append(f"- 추가가입: {', '.join(adds)}")
+    if dels:
+        lines.append(f"- 해지: {', '.join(dels)}")
+    store_block = ("\n".join(lines) + "\n\n") if lines else ""
+    brand_text = f"({brand}) " if brand else ""
+    return (
+        "안녕하세요\n"
+        f"㈜세정{brand_text and ' ' + brand_text}{what} 정산 양식 보내드립니다.\n\n"
+        + store_block +
+        "진행 부탁드리고, 서류 보내주시면 감사하겠습니다.\n"
+        "수고하세요\n\n"
+        "--\n" + _CERT_EMAIL_SIGNATURE
+    )
 
 
-def _sejung_cert_body(kind: str, refund_date: str | None = None) -> str:
+def _chubb_request_subject(items: list, brand: str | None, desc: str) -> str:
+    kinds = {i.get("kind") for i in items}
+    what = "추가가입·해지" if {"추가", "해지"} <= kinds else "추가가입" if "추가" in kinds else "해지" if "해지" in kinds else "변경"
+    return f"[㈜세정 {brand or ''}] {what} 정산 양식 송부 ({desc})"
+
+
+def _sejung_cert_body(kind: str, refund_date: str | None = None, store: str | None = None) -> str:
     what = "추가매장의 보험가입증명서를" if kind == "추가" else "해지매장의 변경증서(환급)를"
+    # 어떤 매장의 추가/해지 건인지 본문에 명시(2026-11-16 요청)
+    store_line = ""
+    if store:
+        store_line = (f"- 추가(보험가입증명서): {store}\n" if kind == "추가"
+                      else f"- 해지(변경증명서): {store}\n")
     # 해지 건은 처브 메일에 적힌 환급 지급 예정일을 같이 안내(2026-11-16 유진님 요청)
     refund_line = ""
     if kind != "추가" and refund_date:
@@ -4457,8 +4508,8 @@ def _sejung_cert_body(kind: str, refund_date: str | None = None) -> str:
         refund_line = f"환급보험료는 {int(mo)}월 {int(d)}일에 지급될 예정입니다.\n"
     return (
         "안녕하십니까~\n"
-        f"보내주신 {what} 보내드립니다.\n"
-        + refund_line +
+        f"보내주신 {what} 보내드립니다.\n\n"
+        + store_line + refund_line + ("\n" if (store_line or refund_line) else "") +
         "업무에 참고하여 주시기 바랍니다.\n\n"
         "즐거운 하루 보내십시요\n"
         "감사합니다.\n"
@@ -4643,10 +4694,10 @@ async def _sj_handle_request_file(bot, filename: str, file_bytes: bytes,
 
     brand = next((i.get("brand") for i in items if i.get("brand")), None) or "브랜드 미확인"
     desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
-    subject = f"[㈜세정 {brand}] 정산 양식 송부 ({desc})"
+    subject = _chubb_request_subject(items, brand, desc)
     cert_id = _queue_pending_certs(
         [{"store_name": desc, "out_name": filename, "pdf_bytes": file_bytes}],
-        target_email=", ".join(CHUBB_RECIPIENTS), subject=subject, body=_CHUBB_REQUEST_BODY,
+        target_email=", ".join(CHUBB_RECIPIENTS), subject=subject, body=_chubb_request_body(items, brand),
         label="변경신청서",
     )
     who = sender_email or "텔레그램 업로드"
@@ -4654,7 +4705,7 @@ async def _sj_handle_request_file(bot, filename: str, file_bytes: bytes,
         chat_id=ALLOWED_USER_ID,
         text=(
             f"📨 ㈜세정 변경신청서가 왔어요 ({brand}, {desc}, 보낸 사람: {who}).\n"
-            f"처브 담당자 4명({', '.join(CHUBB_RECIPIENTS)})에게 보낼까요?"
+            f"처브 담당자 {len(CHUBB_RECIPIENTS)}명({', '.join(CHUBB_RECIPIENTS)})에게 보낼까요?"
         ),
         reply_markup=_queue_confirm_keyboard(cert_id),
     )
@@ -5019,7 +5070,7 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
     # 브랜드명/증권번호, '세정' 글자). 예전엔 '요청'+'가입' 같은 단어만 보고 다른 거래처 메일
     # (예: 파블로항공 드론보험 견적요청)까지 세정 신청으로 잘못 처리했음(2026-11-16).
     is_sejung = (
-        "sejung" in (sender_email or "").lower()
+        any(d in (sender_email or "").lower() for d in ("sejung", "ovlr"))
         or "세정" in text_all
         or _sj_brand_from_text(text_all) is not None
     )
@@ -5053,8 +5104,8 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
     cert_id = _queue_pending_certs(
         [{"store_name": desc, "out_name": fn, "pdf_bytes": data} for fn, data in attachments],
         target_email=", ".join(CHUBB_RECIPIENTS),
-        subject=f"[㈜세정 {brand or ''}] 정산 양식 송부 ({desc})",
-        body=_CHUBB_REQUEST_BODY,
+        subject=_chubb_request_subject(items, brand, desc),
+        body=_chubb_request_body(items, brand),
         label="변경신청서",
     )
     files = ", ".join(fn for fn, _ in attachments)
@@ -5069,7 +5120,7 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         text=(
             f"📨 ㈜세정 변경신청서({source}): {brand or '브랜드 미확인'}, {desc}, 보낸 사람: {who}\n"
             + "\n".join(list_msgs) + "\n" + save_msg +
-            f"\n\n첨부 {len(attachments)}개({files})를 그대로 붙여서 처브 담당자 4명에게 보낼까요?"
+            f"\n\n첨부 {len(attachments)}개({files})를 그대로 붙여서 처브 담당자 {len(CHUBB_RECIPIENTS)}명에게 보낼까요?"
         ),
         reply_markup=_queue_confirm_keyboard(cert_id),
     )
@@ -5587,7 +5638,7 @@ async def _sj_queue_to_sejung(bot, target_email: str, store: str, kind: str, bra
         [{"store_name": store, "out_name": filename, "pdf_bytes": pdf_bytes}],
         target_email=target_email,
         subject=f"[㈜세정 {brand}] {store} {label}",
-        body=_sejung_cert_body(kind, refund_date),
+        body=_sejung_cert_body(kind, refund_date, store),
         label=label,
     )
     await bot.send_message(
