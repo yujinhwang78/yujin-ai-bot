@@ -5456,7 +5456,9 @@ def _sj_cert_filename(code: str | None, store: str, kind: str, cert: dict, req: 
     d = _sj_to_date(d)
     date_text = d.strftime("%Y-%m-%d") if d else dt.date.today().isoformat()
     safe_store = re.sub(r'[\\/:*?"<>|]', "", store).strip()
-    return f"{code or '코드미확인'}_{safe_store}_{date_text}.pdf"
+    # 가입증명서와 해지 변경증명서가 같은 매장·비슷한 날짜면 이름이 같아져서 앞에 구분 표시를 붙임(2026-11-16 요청)
+    prefix = "[가입]" if kind == "추가" else "[해지]"
+    return f"{prefix}{code or '코드미확인'}_{safe_store}_{date_text}.pdf"
 
 
 def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None,
