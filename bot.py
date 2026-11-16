@@ -4849,6 +4849,16 @@ async def _sj_handle_receiver_reply(update: Update, user_text: str) -> bool:
         if not any(_sj_norm(it["store_name"]) in n for w in waiting for it in w.get("items", [])):
             return False
     idx = _sj_pick_waiting(update, waiting, "items")
+    if _SJ_CANCEL_RE.search(text):
+        # '직접 보냈어' 같은 답은 이름이 아님 - 접수자 질문은 접고, 증명서 발송 대기 취소는
+        # 아래 증명서 담당자 처리에서 이어서 하도록 넘김(2026-11-16: '장유롯데'를 이름으로 적던 문제)
+        dropped = waiting.pop(idx)
+        _sj_save(SEJUNG_AWAIT_RECEIVER_FILE, waiting)
+        if _sj_load(SEJUNG_AWAIT_FILE, []):
+            return False
+        names = ", ".join(i["store_name"] for i in dropped.get("items", []))
+        await update.message.reply_text(f"🗑 '{names}' 접수자 질문은 넘어갈게요(통합관리리스트는 그대로 둬요).")
+        return True
     entry = waiting.pop(idx)
     _sj_save(SEJUNG_AWAIT_RECEIVER_FILE, waiting)
     name = _sj_name_from_reply(text)
@@ -5723,6 +5733,9 @@ async def sejung_cancel_wait_command(update: Update, context: ContextTypes.DEFAU
     )
 
 
+_SJ_CANCEL_RE = re.compile(r"직접\s*보냈|이미\s*보냈|보냈어|보냈습니다|보냈음|안\s*보내|보내지\s*마|취소|필요\s*없")
+
+
 def _sj_name_from_reply(text: str) -> str:
     """'세정 장혜진 님한테 메일 보내줘' 같은 문장에서 담당자 이름만 뽑음. 등록된 연락처 이름이
     문장 안에 있으면 그걸 우선 씀(2026-11-16: 문장 전체를 이름으로 착각하던 문제 수정)."""
@@ -5730,6 +5743,10 @@ def _sj_name_from_reply(text: str) -> str:
     for name in sorted(_load_contacts().keys(), key=len, reverse=True):
         if name and name in t.replace(" ", ""):
             return name
+    waiting_names = [w.get("store") for w in _sj_load(SEJUNG_AWAIT_FILE, [])] + [
+        i.get("store_name") for w in _sj_load(SEJUNG_AWAIT_RECEIVER_FILE, []) for i in w.get("items", [])]
+    for st in sorted([x for x in waiting_names if x], key=len, reverse=True):
+        t = t.replace(st, " ")
     t = re.sub(r"(㈜|\(주\))?\s*세정", " ", t)
     t = re.sub(r"(담당자|대리|과장|차장|부장|팀장|주임|사원|대표|님|씨)", " ", t)
     t = re.sub(r"(한테|에게|께|으로|로)?\s*(이?메일|메일로)?\s*(보내\S*|전달\S*|부탁\S*)", " ", t)
@@ -5766,7 +5783,7 @@ async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool
     idx = _sj_pick_waiting(update, awaiting, "store")
     item = awaiting[idx]
     # '직접 보냈어', '안 보내도 돼', '취소' 같은 답이면 발송 대기를 취소(2026-11-16 유진님 요청)
-    if re.search(r"직접\s*보냈|이미\s*보냈|보냈어|보냈습니다|안\s*보내|보내지\s*마|취소|필요\s*없", text):
+    if _SJ_CANCEL_RE.search(text):
         awaiting.pop(idx)
         _sj_save(SEJUNG_AWAIT_FILE, awaiting)
         try:
