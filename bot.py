@@ -4735,7 +4735,9 @@ def _sj_extract_request_from_text(subject: str, body: str, pdf_texts: list) -> l
         '"property_refund": 재물 환급보험료 숫자, "liability_refund": 배상 환급보험료 숫자, '
         '"refund_account": 환급 계좌/위임받는 분 문구}]}\n'
         "가입/추가가입(소재지 추가)은 추가, 해지/폐점/환급(소재지 제외)은 해지예요. 같은 매장에 해지와 추가가 "
-        "같이 있으면 두 개로 나눠 적으세요. 금액이 '-'면 0, 모르면 null로 두세요."
+        "같이 있으면 두 개로 나눠 적으세요. 금액이 '-'면 0, 모르면 null로 두세요.\n"
+        "start_date/end_date는 반드시 '변경기간(Period)' 칸의 날짜예요. '원보험기간(Policy Period, 예: "
+        "2026.11.12 ~ 2027.11.12)'은 계약 전체 기간이라 절대 쓰지 마세요. 변경기간을 못 찾으면 null로 두세요."
     )
     content = f"제목: {subject}\n본문:\n{(body or '')[:3000]}\n\nPDF 내용:\n" + "\n---\n".join(t[:4000] for t in pdf_texts)
     try:
@@ -5383,16 +5385,35 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
     if update_match:
         # 신청서 때 이미 적어둔 같은 매장 줄이 있으면 그 줄을 갱신(중복 줄 방지). 날짜가 둘 다
         # 있는데 다르면(같은 매장의 다른 건) 새 줄로 봄.
+        # 2026-11-17 보강: 날짜가 달라도 같은 매장 줄이 아직 '증명서 대기'(처리 중)면 같은 건으로 보고
+        # 그 줄을 고쳐 씀. (롯데김해아울렛직영특판점이 1차로 잘못 읽은 날짜 11/12로 한 줄,
+        # 2차로 바른 날짜 12/09로 또 한 줄 들어가 중복된 사고 방지)
         date_key = "보험시작일" if want == "추가" else "폐점일"
         dcol = header.get(date_key)
         want_d = _sj_to_date(values.get(date_key))
         name_target = _sj_norm(values.get("매장명"))
+        st_col = header.get("업무상태")
+        nt_col = header.get("비고")
+
+        def _sj_row_pending(row: int) -> bool:
+            if st_col:
+                sv = str(ws.cell(row=row, column=st_col).value or "")
+                if sv.strip():
+                    return "대기" in sv
+            if nt_col:
+                return _SJ_STATUS_WAIT in str(ws.cell(row=row, column=nt_col).value or "")
+            return False
+
+        exact, pending = None, None
         for r in range(template_row, ws.max_row + 1):
             if _sj_norm(ws.cell(row=r, column=name_col).value) != name_target:
                 continue
             cd = _sj_to_date(ws.cell(row=r, column=dcol).value) if dcol else None
             if want_d is None or cd is None or cd.date() == want_d.date():
-                target = r
+                exact = r
+            elif _sj_row_pending(r):
+                pending = r
+        target = exact if exact is not None else pending
     updating = target is not None
     if target is None:
         target = template_row
