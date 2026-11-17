@@ -5723,8 +5723,17 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: 
         with open(path, "wb") as f:
             f.write(pdf_bytes)
         awaiting = _sj_load(SEJUNG_AWAIT_FILE, [])
+        # 같은 매장·같은 종류가 이미 대기 중이면 새 것으로 바꿈(같은 매장이 두 번 쌓이던 문제, 2026-11-17)
+        for w in [w for w in awaiting if w.get("brand") == brand and w.get("kind") == kind
+                  and _sj_norm(w.get("store")) == _sj_norm(store)]:
+            awaiting.remove(w)
+            if w.get("path") != path:
+                try:
+                    os.remove(w.get("path") or "")
+                except OSError:
+                    pass
         awaiting.append({"store": store, "kind": kind, "brand": brand, "filename": filename, "path": path,
-                         "refund_date": refund_date})
+                         "refund_date": refund_date, "asked_at": dt.datetime.now().timestamp()})
         _sj_save(SEJUNG_AWAIT_FILE, awaiting)
         await _send_message_retrying(
             bot, ALLOWED_USER_ID,
@@ -5805,19 +5814,35 @@ def _sj_name_from_reply(text: str) -> str:
     return words[0] if words else (text or "").strip()
 
 
+def _sj_waiting_stores(w: dict, key: str) -> list:
+    return [w.get(key)] if isinstance(w.get(key), str) else [x.get("store_name") for x in w.get("items", [])]
+
+
+def _sj_latest_waiting(waiting: list) -> int:
+    """봇이 가장 마지막에 물어본 건의 위치(질문 시각이 없으면 목록의 맨 뒤)."""
+    return max(range(len(waiting)), key=lambda i: (waiting[i].get("asked_at") or 0, i))
+
+
 def _sj_pick_waiting(update: Update, waiting: list, key: str) -> int:
     """대기 목록 중 이번 답이 어느 건에 대한 것인지 고름: 유진님이 '답장'한 봇 메시지에 적힌 매장명
-    -> 답 문장에 있는 매장명 -> 가장 오래된 건 순. (2026-11-16: 이천직영점 질문에 답했는데 맨 앞의
-    롯데동부산아울렛점 건으로 처리되던 문제 수정)"""
+    -> 답 문장에 있는 매장명(일부만 적어도 됨) -> 봇이 가장 마지막에 물어본 건 순.
+    (2026-11-17: 매장명 없이 이름만 답하면 가장 오래된 건으로 처리돼, 방금 물어본 OL이천직영점
+    대신 예전에 남아 있던 롯데동부산아울렛점으로 발송 준비되던 문제 수정)"""
     reply_to = getattr(update.message, "reply_to_message", None)
     sources = [getattr(reply_to, "text", "") or "", getattr(update.message, "text", "") or ""]
     for src in sources:
         n = _sj_norm(src)
         for i, w in enumerate(waiting):
-            stores = [w.get(key)] if isinstance(w.get(key), str) else [x.get("store_name") for x in w.get("items", [])]
-            if any(st and _sj_norm(st) in n for st in stores):
+            if any(st and _sj_norm(st) in n for st in _sj_waiting_stores(w, key)):
                 return i
-    return 0
+    # '동부산아울렛점 직접 보냈어'처럼 매장명을 일부만 적은 경우: 딱 한 매장에만 맞을 때만 인정
+    tokens = [_sj_norm(t) for t in re.findall(r"[0-9A-Za-z가-힣]+점", getattr(update.message, "text", "") or "")]
+    tokens = [t for t in tokens if len(t) >= 3]
+    hits = [i for i, w in enumerate(waiting)
+            if any(st and t in _sj_norm(st) for st in _sj_waiting_stores(w, key) for t in tokens)]
+    if hits and len({_sj_norm(str(_sj_waiting_stores(waiting[i], key))) for i in hits}) == 1:
+        return hits[0]
+    return _sj_latest_waiting(waiting)
 
 
 async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool:
@@ -5879,7 +5904,15 @@ async def _sj_handle_await_contact_reply(update: Update, user_text: str) -> bool
     await _sj_queue_to_sejung(update.get_bot(), target, item["store"], item["kind"], item["brand"],
                               item["filename"], pdf_bytes, who, item.get("refund_date"))
     if awaiting:
-        await update.message.reply_text(f"다음으로 '{awaiting[0]['store']}' 담당자도 알려주세요.")
+        # 다음에 실제로 처리될 건(가장 최근 건)을 묻고, 그 건을 '마지막으로 물어본 건'으로 표시
+        nxt = awaiting[_sj_latest_waiting(awaiting)]
+        nxt["asked_at"] = dt.datetime.now().timestamp()
+        _sj_save(SEJUNG_AWAIT_FILE, awaiting)
+        others = [w["store"] for w in awaiting if w is not nxt]
+        await update.message.reply_text(
+            f"다음으로 '{nxt['store']}' 담당자도 알려주세요. 직접 보내셨으면 '{nxt['store']} 직접 보냈어'라고 답해주세요."
+            + (f"\n(그 밖의 대기 건: {', '.join(others)} - 매장명과 이름을 같이 보내주시면 그 건으로 처리해요)" if others else "")
+        )
     return True
 
 
