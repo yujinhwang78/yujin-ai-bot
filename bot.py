@@ -4529,6 +4529,26 @@ def _sj_norm(s) -> str:
     return re.sub(r"\s+", "", s).lower()
 
 
+# 처브가 증명서에 매장명을 줄여 쓰는 경우가 있음(예: 신청서 '롯데김해아울렛직영특판점' ->
+# 증명서 '롯데김해아울렛특판점', 2026-11-18). 매장 '종류'를 나타내는 말을 빼고 비교함.
+_SJ_STORE_NOISE_RX = re.compile(r"직영|상설|특판|매장|점$|[()\[\]（）·\-_]")
+
+
+def _sj_store_core(s) -> str:
+    return _SJ_STORE_NOISE_RX.sub("", _sj_norm(s))
+
+
+def _sj_store_similar(a, b) -> bool:
+    """매장명이 사실상 같은지(종류 표기만 다른지). 빈 값이면 False."""
+    ca, cb = _sj_store_core(a), _sj_store_core(b)
+    if not ca or not cb:
+        return False
+    if ca == cb:
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, ca, cb).ratio() >= 0.9
+
+
 def _sj_brand_from_text(*texts) -> str | None:
     joined = " ".join(str(t or "") for t in texts)
     for pno, brand in SEJUNG_POLICY_BRAND.items():
@@ -4670,7 +4690,7 @@ def _sj_find_request(brand: str | None, store_name: str) -> dict | None:
             continue
         if name == target:
             return rec
-        if name in target or target in name:
+        if name in target or target in name or _sj_store_similar(name, target):
             best = best or rec
     return best
 
@@ -5498,16 +5518,32 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
                 return _SJ_STATUS_WAIT in str(ws.cell(row=row, column=nt_col).value or "")
             return False
 
-        exact, pending = None, None
+        addr_col = header.get("매장주소")
+        addr_target = _sj_norm(values.get("매장주소"))
+        exact, pending, similar = None, None, None
         for r in range(template_row, ws.max_row + 1):
-            if _sj_norm(ws.cell(row=r, column=name_col).value) != name_target:
-                continue
+            row_name = ws.cell(row=r, column=name_col).value
             cd = _sj_to_date(ws.cell(row=r, column=dcol).value) if dcol else None
-            if want_d is None or cd is None or cd.date() == want_d.date():
+            same_date = want_d is None or cd is None or cd.date() == want_d.date()
+            if _sj_norm(row_name) != name_target:
+                # 2026-11-18 보강: 증명서 매장명이 신청서와 조금 달라도(예: '직영' 빠짐), 아직 '증명서 대기'인
+                # 줄 중 매장명이 사실상 같고 날짜나 주소가 같은 줄이면 같은 건으로 보고 그 줄을 고침.
+                # (롯데김해아울렛직영특판점 / 롯데김해아울렛특판점 두 줄 중복 사고 방지)
+                if (cert_review and similar is None and _sj_row_pending(r)
+                        and _sj_store_similar(row_name, values.get("매장명"))):
+                    row_addr = _sj_norm(ws.cell(row=r, column=addr_col).value) if addr_col else ""
+                    if want_d is not None and cd is not None:
+                        ok = same_date  # 날짜가 둘 다 있으면 날짜가 같아야 같은 건
+                    else:
+                        ok = bool(addr_target and row_addr and (addr_target in row_addr or row_addr in addr_target))
+                    if ok:
+                        similar = r
+                continue
+            if same_date:
                 exact = r
             elif _sj_row_pending(r):
                 pending = r
-        target = exact if exact is not None else pending
+        target = exact if exact is not None else (pending if pending is not None else similar)
     updating = target is not None
     if target is None:
         target = template_row
