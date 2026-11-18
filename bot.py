@@ -5353,6 +5353,51 @@ def _sj_find_master(service, root_id: str) -> dict | None:
     return None
 
 
+def _sj_drive_save_pdf_once(service, folder_id: str, name: str, pdf_bytes: bytes) -> str:
+    """같은 증명서가 폴더에 두 번 쌓이지 않게 저장(2026-11-18 요청).
+    - 내용이 똑같은 파일이 이미 있으면: 새로 만들지 않음(이름이 다르면 정해진 이름으로 바꿈)
+    - 이름이 같은 파일이 있으면(처브 재송부 등 내용만 다름): 그 파일 내용을 새 것으로 교체
+    - 둘 다 없으면 새로 만듦
+    반환: 'same' / 'renamed:<옛 이름>' / 'replaced' / 'created'"""
+    import hashlib
+    md5 = hashlib.md5(pdf_bytes).hexdigest()
+    files, token = [], None
+    while True:
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id,name,md5Checksum)", pageSize=200, pageToken=token,
+        ).execute()
+        files += resp.get("files", [])
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    want = unicodedata.normalize("NFC", name)
+    same_name = [f for f in files if unicodedata.normalize("NFC", f.get("name", "")) == want]
+    same_content = [f for f in files if f.get("md5Checksum") == md5]
+    if same_content:
+        keep = next((f for f in same_content if f in same_name), same_content[0])
+        if unicodedata.normalize("NFC", keep.get("name", "")) == want:
+            return "same"
+        if same_name:
+            # 정해진 이름의 파일이 따로 이미 있으면 이름을 바꾸면 이름이 겹치니, 그 파일을 새 내용으로 교체만 함
+            service.files().update(
+                fileId=same_name[0]["id"], media_body=_gdrive_media(pdf_bytes, mimetype="application/pdf"),
+            ).execute()
+            return "replaced"
+        service.files().update(fileId=keep["id"], body={"name": name}).execute()
+        return "renamed:" + keep.get("name", "")
+    if same_name:
+        service.files().update(
+            fileId=same_name[0]["id"], media_body=_gdrive_media(pdf_bytes, mimetype="application/pdf"),
+        ).execute()
+        return "replaced"
+    service.files().create(
+        body={"name": name, "parents": [folder_id]},
+        media_body=_gdrive_media(pdf_bytes, mimetype="application/pdf"), fields="id",
+    ).execute()
+    return "created"
+
+
 def _sj_month_folder(service, root_id: str, brand: str, sub: str | None = None) -> str:
     """sub는 '변경신청서/추가가입신청서'처럼 '/'로 여러 단계를 줄 수 있음."""
     """정산관리/브랜드/(종류 폴더)/YY년 M월 폴더 id. 종류 폴더는 유진님이 정한 구조에 맞춤:
@@ -5740,12 +5785,18 @@ def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None
     try:
         sub = "추가가입증명서" if kind == "추가" else "해지변경증명서"
         month_id = _sj_month_folder(service, root, brand, sub)
-        service.files().create(
-            body={"name": out_name, "parents": [month_id]},
-            media_body=_gdrive_media(pdf_bytes, mimetype="application/pdf"), fields="id",
-        ).execute()
+        action = _sj_drive_save_pdf_once(service, month_id, out_name, pdf_bytes)
         today = dt.datetime.now(KST).date()
-        saved_msg = f"💾 드라이브 정산관리/{brand}/{sub}/{today:%y}년 {today.month}월 폴더에 '{out_name}'로 저장했어요."
+        where_txt = f"드라이브 정산관리/{brand}/{sub}/{today:%y}년 {today.month}월 폴더"
+        if action == "same":
+            saved_msg = f"💾 {where_txt}에 같은 파일 '{out_name}'이 이미 있어서 새로 저장하지 않았어요."
+        elif action.startswith("renamed:"):
+            saved_msg = (f"💾 {where_txt}에 같은 내용의 파일('{action[8:]}')이 이미 있어서, "
+                         f"새로 저장하지 않고 이름만 '{out_name}'로 바꿨어요.")
+        elif action == "replaced":
+            saved_msg = f"💾 {where_txt}의 '{out_name}'을 새로 받은 증명서로 바꿔 저장했어요(중복 없이)."
+        else:
+            saved_msg = f"💾 {where_txt}에 '{out_name}'로 저장했어요."
     except Exception as e:
         logger.exception("처브 증명서 드라이브 저장 중 오류")
         saved_msg = f"❌ 드라이브 저장 실패: {type(e).__name__}"
