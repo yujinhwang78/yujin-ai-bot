@@ -4635,13 +4635,24 @@ def _sj_parse_request(file_bytes: bytes, filename: str = "") -> list | None:
             if not store:
                 continue
             fields = _sj_row_by_headers(ws, (5, 4), 6, 25, 43)  # Y~AQ
+            # 보험기간·주소는 신청서 본문 칸을 우선함. 오른쪽 '리스트 복사用' 줄(AN6/AO6)은 종기가
+            # 실제 변경기간과 상관없이 원보험 종기(2027-11-12)로 고정돼 있고 주소(AF6)도 비어 있는 경우가 많음
+            # (2026-11-18 WMC 특판 9건: 실제 종기 2027-02-28인데 1년으로 기재되고 주소 누락).
+            def _cell(addr):
+                v = ws[addr].value
+                return v.strip() if isinstance(v, str) else v
+            period_start, period_end = _cell("F17"), _cell("L17")
             fields.update({
                 "매장명": str(store).strip(),
                 "평수": ws["O19"].value or fields.get("평수"),
                 "건물": ws["F23"].value,
                 "시설/비품": ws["F24"].value,
                 "재고": ws["F25"].value,
-                "보험시작일": ws["O16"].value or fields.get("보험시작일"),
+                "보험시작일": (period_start if _sj_to_date(period_start) else None)
+                              or ws["O16"].value or fields.get("보험시작일"),
+                "보험종기일": (period_end if _sj_to_date(period_end) else None) or fields.get("보험종기일"),
+                "매장주소": _cell("F11") or fields.get("매장주소"),
+                "창고주소": _cell("F12") or fields.get("창고주소"),
             })
             items.append({"kind": "추가", "brand": brand, "store_name": str(store).strip(), "fields": fields})
         elif n.startswith("해지_배서"):
@@ -4794,6 +4805,114 @@ def _sj_extract_request_from_text(subject: str, body: str, pdf_texts: list) -> l
                 f["비고"] = f"환급: {st.get('refund_account')}"
         out.append({"store_name": name, "kind": kind, "fields": {k: v for k, v in f.items() if v not in (None, "")}})
     return out
+
+
+# ---------- PDF 신청서를 규칙대로 직접 읽기 (2026-11-18 유진님 요청) ----------
+# 신청서가 PDF로 와도 엑셀과 같은 기준으로 기재: 보험기간은 '변경기간(Period)' 칸, 폐점일은 '유효일',
+# 주소는 '소재지'·'창고주소' 칸. Claude가 뽑은 값보다 이 규칙값을 우선함(Claude가 원보험기간
+# 2027-11-12를 종기로 잘못 쓰는 경우를 막기 위함).
+_SJ_PDF_D = r"(\d{4})\s*[년.\-/]\s*(\d{1,2})\s*[월.\-/]\s*(\d{1,2})\s*일?"
+
+
+def _sj_pdf_date(m, i: int):
+    try:
+        return dt.datetime(int(m.group(i)), int(m.group(i + 1)), int(m.group(i + 2))).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _sj_pdf_clean_addr(s):
+    s = re.sub(r"\s+", " ", s or "").strip()
+    # 칸이 비어서 다른 글자까지 잡힌 경우는 버림
+    if not s or len(s) > 120 or re.search(r"Policy|KRW|Insured|\d{3}-\d{2}-\d{5}|일간|매장명", s):
+        return None
+    return s
+
+
+def _sj_parse_request_pdf(file_bytes: bytes) -> list:
+    """PDF '보험계약 변경 승인신청서'를 장(page)별로 읽어 [{kind, store_name, fields}] 반환.
+    매장명을 못 읽은 장도 store_name=None으로 넣음(Claude 결과와 맞춰 쓰기 위해)."""
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages = [unicodedata.normalize("NFC", p.extract_text() or "") for p in reader.pages]
+    except Exception:
+        return []
+    out = []
+    for t in pages:
+        flat = t.replace(" ", "").replace("\n", "")
+        if "변경승인신청서" not in flat and "RequestforPolicyAmend" not in flat:
+            continue
+        if "소재지추가" in flat or "IncreasedTSI" in flat:
+            kind = "추가"
+        elif "소재지제외" in flat or "DecreasedTSI" in flat:
+            kind = "해지"
+        else:
+            continue
+        f = {}
+        m = re.search(r"변경기간\s*Period\s*" + _SJ_PDF_D + r"\s*~?\s*" + _SJ_PDF_D, t)
+        start, end = (_sj_pdf_date(m, 1), _sj_pdf_date(m, 4)) if m else (None, None)
+        m = re.search(r"유효일\s*Ef+ective\s*Date\s*" + _SJ_PDF_D, t, re.I)
+        effective = _sj_pdf_date(m, 1) if m else None
+        m = re.search(r"소재지\s*Location\s*of\s*Insured\s*(.*?)\s*원보험기간", t, re.S)
+        addr = _sj_pdf_clean_addr(m.group(1)) if m else None
+        # PDF 만드는 방식에 따라 '창고주소 건물 내 621-81-19659'처럼 사업자번호와 한 줄로 붙기도 함
+        m = re.search(r"창고주소\s*(.*?)\s*(?:법인등록번호|\d{3}-\d{2}-\d{5})", t, re.S)
+        wh = _sj_pdf_clean_addr(m.group(1)) if m else None
+        store = None
+        if kind == "추가":
+            m = re.search(r"(?:^|\n)([^\n]*?)\s*면적\s*\n?\s*\(P\)", t)
+            if m:
+                store = m.group(1).strip() or None
+            if start or effective:
+                f["보험시작일"] = start or effective
+            if end:
+                f["보험종기일"] = end
+            if wh:
+                f["창고주소"] = wh
+        else:
+            m = re.search(r"매장명[ \t]+([^\n]+?)[ \t]+가입\s*시\s*납입보험료", t)
+            if m:
+                store = m.group(1).strip() or None
+            if effective or start:
+                f["폐점일"] = effective or start
+        if not store and not addr:
+            continue  # 매장명·주소가 다 빈 장은 양식만 붙어 온 빈 장으로 봄
+        if addr:
+            f["매장주소"] = addr
+        if store:
+            f["매장명"] = store
+        out.append({"kind": kind, "store_name": store, "fields": f})
+    return out
+
+
+def _sj_apply_pdf_rules(items: list, rule_items: list) -> list:
+    """Claude가 뽑은 매장 목록(items)에 PDF 규칙값(rule_items)을 덮어씀.
+    매장명이 비슷하면 그 장 값으로, 매장명을 못 읽었으면 같은 종류가 한 장씩뿐일 때만 맞춤.
+    Claude가 놓친 매장(규칙으로 매장명을 읽은 장)은 새로 추가함."""
+    used = set()
+    for it in items:
+        cands = [i for i, r in enumerate(rule_items) if i not in used and r["kind"] == it["kind"]]
+        hit = next((i for i in cands if rule_items[i]["store_name"] and (
+            _sj_norm(rule_items[i]["store_name"]) == _sj_norm(it["store_name"])
+            or _sj_store_similar(rule_items[i]["store_name"], it["store_name"]))), None)
+        if hit is None:
+            same_kind_items = [x for x in items if x["kind"] == it["kind"]]
+            if len(cands) == 1 and len(same_kind_items) == 1 and not rule_items[cands[0]]["store_name"]:
+                hit = cands[0]
+        if hit is None:
+            continue
+        used.add(hit)
+        fields = it.setdefault("fields", {})
+        for k, v in rule_items[hit]["fields"].items():
+            if k != "매장명":
+                fields[k] = v
+    for i, r in enumerate(rule_items):
+        if i in used or not r["store_name"]:
+            continue
+        if any(x["kind"] == r["kind"] and _sj_store_similar(x["store_name"], r["store_name"]) for x in items):
+            continue
+        items.append({"kind": r["kind"], "store_name": r["store_name"], "fields": dict(r["fields"])})
+    return items
 
 
 def _sj_list_info(wb, store_name: str) -> dict:
@@ -5084,6 +5203,7 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         if parsed:
             items.extend(parsed)
     pdf_texts, has_pdf_request = [], False
+    pdf_request_texts, pdf_rule_items = [], []
     for fn, data in others:
         if fn.lower().endswith(".pdf"):
             t = _extract_pdf_text(data)
@@ -5092,6 +5212,8 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
             if _sj_pdf_is_request(t):
                 has_pdf_request = True
                 request_files.append((fn, data))
+                pdf_request_texts.append(t)
+                pdf_rule_items.extend(_sj_parse_request_pdf(data))
             pdf_texts.append(t)
     text_all = f"{subject} {body}"
     # 제목/본문만으로 신청 메일로 볼 때는 반드시 ㈜세정 건이라는 표시가 있어야 함(세정 메일 주소,
@@ -5112,8 +5234,22 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
              or _sj_brand_from_text(subject, body, *pdf_texts, *[fn for fn, _ in attachments]))
     if not items:
         found = await asyncio.to_thread(_sj_extract_request_from_text, subject, body, pdf_texts)
+        if pdf_rule_items:
+            found = _sj_apply_pdf_rules(found, pdf_rule_items)
         items = [{"kind": f["kind"], "brand": brand, "store_name": f["store_name"], "fields": f.get("fields") or {}}
                  for f in found]
+    elif has_pdf_request:
+        # 엑셀 신청서와 PDF 신청서가 같이 온 메일: PDF에만 있는 매장도 빠뜨리지 않고 기재
+        found = await asyncio.to_thread(_sj_extract_request_from_text, subject, "", pdf_request_texts)
+        if pdf_rule_items:
+            found = _sj_apply_pdf_rules(found, pdf_rule_items)
+        for f in found:
+            if any(i["kind"] == f["kind"] and (_sj_norm(i["store_name"]) == _sj_norm(f["store_name"])
+                                               or _sj_store_similar(i["store_name"], f["store_name"]))
+                   for i in items):
+                continue  # 엑셀에 이미 있는 매장은 엑셀 값 그대로
+            items.append({"kind": f["kind"], "brand": brand, "store_name": f["store_name"],
+                          "fields": f.get("fields") or {}})
     for item in items:
         item["brand"] = item.get("brand") or brand
         _sj_remember_request(item, sender_email, sender_name, subject)
