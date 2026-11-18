@@ -62,6 +62,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# httpx가 요청 주소를 INFO로 찍으면 텔레그램 봇 토큰이 Render 로그에 그대로 남음(2026-11-18 발견).
+# 요청 주소 로그는 끄고 경고/오류만 남김.
+for _noisy in ("httpx", "httpx2", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -4451,6 +4455,8 @@ CHUBB_RECIPIENTS = [
 ]
 SEJUNG_BRANDS = ("웰메이드", "올리비아로렌", "트레몰로")
 SEJUNG_POLICY_BRAND = {"310D260840": "웰메이드", "310D260841": "올리비아로렌", "310D260842": "트레몰로"}
+# 한 메일에 처브 증명서 PDF가 이보다 많으면 원계약 전체 발송으로 보고 자동 기재하지 않음(2026-11-18)
+SEJUNG_BULK_CERT_LIMIT = 5
 SEJUNG_BRAND_SYNONYMS = {"월메이드": "웰메이드", "오뷔엘알": "올리비아로렌", "OVLR": "올리비아로렌", "올리비아": "올리비아로렌"}
 SEJUNG_REQUESTS_FILE = os.path.join(PERSIST_DIR, "sejung_requests.json")
 SEJUNG_AWAIT_FILE = os.path.join(PERSIST_DIR, "sejung_await_contact.json")
@@ -5142,8 +5148,82 @@ def _sj_is_chubb_cert_text(text: str) -> bool:
             or "CertificationofEndorsement" in t) and ("처브" in t or "Chubb" in t or "CHUBB" in t or "ACE" in t)
 
 
-def _sj_extract_cert_fields(text: str) -> dict | None:
-    """PDF에서 뽑은 글자(순서가 뒤섞여 있음)를 Claude로 정리해서 필요한 값만 뽑음."""
+_SJ_DATE_RX = re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+
+
+def _sj_regex_cert_fields(text: str, filename: str = "") -> dict:
+    """AI 없이 PDF 글자/파일명에서 핵심 값(매장명·증권번호·보험기간 등)을 직접 찾음.
+    처브가 '원계약 양식'으로 다시 보낸 증명서(2026-11-18)는 AI가 매장명을 못 뽑아서 생긴 예비 장치.
+    금액(재고/시설/건물)은 칸 순서가 뒤섞여 확실하지 않아 여기서는 안 뽑음(None이면 신청서 값을 씀)."""
+    out: dict = {}
+    t = text or ""
+    nospace = t.replace(" ", "")
+    out["doc_type"] = "배서증명서" if "배서증명서" in nospace else "가입증명서"
+    m = re.search(r"배서구분\s*(\S+)", t)
+    if m:
+        out["endorsement_type"] = m.group(1)
+    m = re.search(r"기준일\s*(\d{4}-\d{1,2}-\d{1,2})", t)
+    if m:
+        out["base_date"] = m.group(1)
+    m = re.search(r"\b\d{3}[A-Z]\d{6}\b", t)
+    if m:
+        out["policy_no"] = m.group(0)
+    m = re.search(r"각\s*대리점주\s*\(([^)]*)\)?", t.replace("\n", ""))
+    if m:
+        out["insured"] = "㈜세정, ㈜세정글로벌 및 각 대리점주 (" + m.group(1).strip() + ")"
+    m = re.search(r"면적\s*\(PY\)\s*([\d.]+)", t)
+    if m:
+        try:
+            area = float(m.group(1))
+            if area > 0:  # 0평으로 적힌 증명서(배상 미가입 매장 등)는 리스트 평수를 덮어쓰지 않음
+                out["area_py"] = int(area) if area.is_integer() else area
+        except ValueError:
+            pass
+    m = re.search(r"소재지[ \t]*주소[ \t]*(\S.+)", t)
+    if m and re.search(r"[시군구]", m.group(1)):
+        out["address"] = m.group(1).strip()
+    # 매장명: 예전 양식 '수신인 (점포명) TR장유롯데마트 배서보험료', 원계약 양식 'TR장유롯데마트 총보험료'
+    store = None
+    m = re.search(r"수신인\s*(?:\(점포명\))?\s*(\S[^\n]*?)\s*(?:배서보험료|총보험료|환급보험료)", t)
+    if m:
+        store = m.group(1).strip()
+    if not store:
+        for line in t.split("\n"):
+            m = re.match(r"^\s*(\S[^\n]*?)\s+(?:총보험료|배서보험료|환급보험료)\s*[\d,]*\s*$", line)
+            if m and "수신인" not in m.group(1):
+                store = m.group(1).strip()
+                break
+    # 파일명(예: 'WMJ530A_롯데동부산아울렛점_2026-11-13.pdf')에서 매장코드/매장명 보강
+    base = os.path.splitext(os.path.basename(filename or ""))[0]
+    base = re.sub(r"^\[(?:가입|해지)\]", "", base)
+    parts = [p for p in base.split("_") if p]
+    if parts and re.fullmatch(r"[A-Z]{2,4}\d{3,4}[A-Z]?", parts[0]):
+        out["store_code"] = parts[0]
+        parts = parts[1:]
+    if not store and parts and not re.fullmatch(r"[\d\-]+", parts[0]):
+        store = parts[0]
+    if store:
+        out["store_name"] = store
+    # 보험기간: 발행일자를 뺀 날짜 중 가장 이른 날=시작, 가장 늦은 날=종기
+    dates = []
+    for line in t.split("\n"):
+        if "발행일자" in line:
+            continue
+        for y, mo, d in _SJ_DATE_RX.findall(line):
+            try:
+                dates.append(dt.date(int(y), int(mo), int(d)))
+            except ValueError:
+                pass
+    if dates:
+        out["start_date"] = min(dates).isoformat()
+        if max(dates) != min(dates):
+            out["end_date"] = max(dates).isoformat()
+    return out
+
+
+def _sj_extract_cert_fields(text: str, filename: str = "") -> dict | None:
+    """PDF에서 뽑은 글자(순서가 뒤섞여 있음)를 Claude로 정리해서 필요한 값만 뽑음.
+    AI 답이 비거나 깨지면 _sj_regex_cert_fields 값으로 채움(2026-11-18)."""
     system = (
         "아래는 처브(에이스아메리칸화재해상보험)의 보험가입증명서 또는 배서증명서 PDF에서 뽑은 텍스트예요. "
         "글자 순서가 뒤섞여 있으니 의미를 보고 값을 찾아서, 아래 JSON 형식으로만 답하세요(설명 없이).\n"
@@ -5155,20 +5235,34 @@ def _sj_extract_cert_fields(text: str) -> dict | None:
         '"annual_property_premium": 제1부문 연간보험료 숫자, "annual_liability_premium": 제4부문 연간보험료 숫자, '
         '"total_premium": 총보험료 또는 배서보험료 숫자, "property_refund": 재물 환급보험료 숫자 또는 null, '
         '"liability_refund": 배상 환급보험료 숫자 또는 null, "warehouse": 창고위치}\n'
-        "금액에 '-'만 있으면 0, 모르면 null로 두세요."
+        "금액에 '-'만 있으면 0, 모르면 null로 두세요. 숫자는 쉼표 없이 쓰고, JSON 앞뒤에 다른 글은 쓰지 마세요."
     )
+    data: dict = {}
+    raw = ""
     try:
         resp = client.messages.create(
-            model=MODEL_NAME, max_tokens=800, system=system,
+            model=MODEL_NAME, max_tokens=2000, system=system,
             messages=[{"role": "user", "content": text[:8000]}],
         )
         raw = "".join(b.text for b in resp.content if b.type == "text").strip()
         m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return None
-        data = json.loads(m.group(0))
+        if m:
+            data = json.loads(m.group(0))
+        else:
+            logger.warning("처브 증명서: AI 답에서 JSON을 못 찾음(stop=%s): %s",
+                           getattr(resp, "stop_reason", None), raw[:500])
     except Exception:
-        logger.exception("처브 증명서 내용 읽기 중 오류")
+        logger.exception("처브 증명서 내용 읽기 중 오류. AI 답 앞부분: %s", raw[:500])
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    # AI가 못 채운 값은 PDF 글자/파일명에서 직접 찾은 값으로 보강
+    rx = _sj_regex_cert_fields(text, filename)
+    for k, v in rx.items():
+        if data.get(k) in (None, "", "null"):
+            data[k] = v
+    if not data.get("store_name"):
+        logger.warning("처브 증명서: 매장명 못 찾음. AI 답 앞부분: %s", raw[:300])
         return None
     et = str(data.get("endorsement_type") or "")
     if data.get("doc_type") == "가입증명서" or "추가" in et:
@@ -5602,7 +5696,8 @@ def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None
     except Exception:
         logger.exception("통합관리리스트 열기 중 오류")
 
-    code = req_code or (_sj_lookup_store_code(wb, store) if wb is not None else None)
+    code = (req_code or (_sj_lookup_store_code(wb, store) if wb is not None else None)
+            or cert.get("store_code"))
     out_name = _sj_cert_filename(code, store, kind, cert, req)
 
     # PDF 저장
@@ -5702,7 +5797,7 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: 
         )
         return True
 
-    cert = await asyncio.to_thread(_sj_extract_cert_fields, text)
+    cert = await asyncio.to_thread(_sj_extract_cert_fields, text, filename)
     if not cert or not cert.get("store_name"):
         await _send_message_retrying(
             bot, ALLOWED_USER_ID,
@@ -6021,9 +6116,17 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
             # 2) 신청 메일이 아니면 처브 증명서(PDF)인지 확인
             if handled_request:
                 continue
-            for att_filename, att_bytes in _extract_non_xlsx_attachments(msg):
-                if not att_filename.lower().endswith(".pdf"):
-                    continue
+            pdf_atts = [(fn, b) for fn, b in _extract_non_xlsx_attachments(msg) if fn.lower().endswith(".pdf")]
+            # 처브가 원계약 증명서 전체(수백 장)를 한 메일에 보내면 하나씩 '추가매장'으로 기재하면 안 됨
+            # (2026-11-18 OL 332장 건). 증명서가 많으면 처리하지 않고 알림만 보냄.
+            if len(pdf_atts) > SEJUNG_BULK_CERT_LIMIT:
+                await _send_message_retrying(
+                    context.bot, ALLOWED_USER_ID,
+                    f"📦 '{subject}' 메일에 PDF가 {len(pdf_atts)}개 있어요. 원계약 전체 증명서 같은 대량 메일이라 "
+                    "통합관리리스트에 자동 기재하지 않았어요. 추가/해지 매장 건이면 그 PDF만 텔레그램으로 올려주세요.",
+                )
+                continue
+            for att_filename, att_bytes in pdf_atts:
                 try:
                     await _sj_handle_cert_file(context.bot, att_filename, att_bytes, _get_email_body(msg))
                 except Exception as e:
