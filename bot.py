@@ -5915,10 +5915,12 @@ def _sj_rebuild_month_column(ws, header: dict, first_row: int = 4) -> None:
 
 
 def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool = False,
-                     cert_review: bool = False, changes: list | None = None) -> str:
+                     cert_review: bool = False, changes: list | None = None,
+                     force_row: int | None = None) -> str:
     """통합관리리스트의 '{브랜드}_추가매장' 또는 '{브랜드}_해지매장' 시트 빈 줄에 기재.
     수식 칸은 건드리지 않고(맨 첫 데이터 줄의 수식을 복사), 이미 값이 들어 있는 칸(종기일 등
-    미리 넣어둔 값)도 덮어쓰지 않음. 기재한 위치 설명을 반환."""
+    미리 넣어둔 값)도 덮어쓰지 않음. 기재한 위치 설명을 반환.
+    force_row: 중복 확인에서 [덮어쓰기]를 누른 경우 그 줄에 새 값을 모두 덮어씀(2026-11-23)."""
     want = "추가" if kind == "추가" else "해지"
     ws = None
     for n in wb.sheetnames:
@@ -5942,7 +5944,9 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
 
     template_row = 4
     target = None
-    if update_match:
+    if force_row:
+        target = force_row
+    elif update_match:
         # 신청서 때 이미 적어둔 같은 매장 줄이 있으면 그 줄을 갱신(중복 줄 방지). 날짜가 둘 다
         # 있는데 다르면(같은 매장의 다른 건) 새 줄로 봄.
         # 2026-11-17 보강: 날짜가 달라도 같은 매장 줄이 아직 '증명서 대기'(처리 중)면 같은 건으로 보고
@@ -6029,7 +6033,7 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
             continue
         # 보험 시작/종기/폐점일은 증명서 날짜가 정답이라, 양식에 미리 적힌 날짜가 있어도 덮어씀
         overwrite = ("보험시작일", "보험종기일", "폐점일") + (_SJ_CERT_OVERWRITE_KEYS if updating else ())
-        if cell.value not in (None, "") and key not in overwrite:
+        if cell.value not in (None, "") and key not in overwrite and not force_row:
             continue
         if updating and cert_review and cell.value not in (None, "") and key in _SJ_CERT_OVERWRITE_KEYS:
             if _sj_same_value(cell.value, values[key]):
