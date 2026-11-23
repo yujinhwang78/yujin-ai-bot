@@ -23,6 +23,7 @@ jobs:
           for key in \
             "def check_livestock_claims" \
             "check_livestock_claims, interval=" \
+            "def _claims_paint_red" \
             "def check_new_mail" \
             "def check_gdrive_health" \
             "def handle_document" \

@@ -4527,6 +4527,17 @@ def _claims_lookup(wb, animal_norm: str) -> dict:
     return info
 
 
+def _claims_paint_red(ws, row: int, last_col: int) -> None:
+    """한 행의 A열~last_col 글씨를 빨간색으로(글꼴·크기·굵기 등은 그대로 두고 색만 바꿈)."""
+    from openpyxl.styles import Font
+    for c in range(1, last_col + 1):
+        cell = ws.cell(row, c)
+        f = cell.font
+        cell.font = Font(name=f.name, size=f.size, bold=f.bold, italic=f.italic,
+                         underline=f.underline, strike=f.strike, vertAlign=f.vertAlign,
+                         charset=f.charset, family=f.family, scheme=f.scheme, color="FFFF0000")
+
+
 def _claims_apply(wb, mails: list[dict]) -> list[dict]:
     """사고내역 시트에 아직 없는 메일 건을 다음 빈 행에 기재. 기재한 건 목록을 반환."""
     ws = wb[CLAIMS_SHEET]
@@ -4566,9 +4577,13 @@ def _claims_apply(wb, mails: list[dict]) -> list[dict]:
         if not ws.cell(target, 12).value and ws.cell(target - 1, 12).value:
             ws.cell(target, 12).value = '="26-"&TEXT(ROW()-3,"000")'
         if info["mark"]:
+            # 가입금액을 가져온 시트(4월갱신시개체별 U열 / 월별추징 T열)의 해당 개체 행:
+            # 맨 끝 칸에 폐사·긴급출하를 적고, 그 행 전체(A열~끝 칸)를 빨간 글씨로 바꿈(기존 표시 방식과 동일)
             sh, coord = info["mark"]
-            if wb[sh][coord].value in (None, ""):
-                wb[sh][coord].value = m["accident"]
+            mark_cell = wb[sh][coord]
+            if mark_cell.value in (None, ""):
+                mark_cell.value = m["accident"]
+            _claims_paint_red(wb[sh], mark_cell.row, mark_cell.column)
         existing.add(key)
         m.update(row=target, info=info)
         added.append(m)
