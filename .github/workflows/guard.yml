@@ -1,0 +1,65 @@
+name: 봇 기능 지킴이
+
+# bot.py가 올라올 때마다(웹 업로드 포함) 필수 기능이 빠지지 않았는지, 문법이 깨지지 않았는지 검사.
+# 문제가 있으면 실패로 표시되고(GitHub이 메일로 알림), 텔레그램 비밀값이 있으면 텔레그램으로도 알림.
+# Render 자동 배포를 "After CI Checks Pass"로 두면, 실패한 버전은 배포되지 않고 기존 봇이 계속 동작함.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 필수 기능 확인 + 문법 검사
+        id: check
+        run: |
+          missing=""
+          # 지켜야 할 기능 목록: 새 기능을 추가하면 여기에 한 줄씩 추가
+          for key in \
+            "def check_livestock_claims" \
+            "check_livestock_claims, interval=" \
+            "def check_new_mail" \
+            "def check_gdrive_health" \
+            "def handle_document" \
+            "def handle_cert_confirmation" \
+            "def _queue_pending_certs" \
+            "def _sj_pdf_is_request" ; do
+            if ! grep -qF "$key" bot.py; then
+              missing="$missing
+          - $key"
+            fi
+          done
+          if ! python3 -m py_compile bot.py 2> compile_err.txt; then
+            missing="$missing
+          - 문법 오류: $(tail -1 compile_err.txt)"
+          fi
+          if [ -n "$missing" ]; then
+            {
+              echo "msg<<EOF"
+              echo "🚨 봇 기능 지킴이: 방금 올린 bot.py에 문제가 있어요"
+              echo "커밋: ${GITHUB_SHA::7} ($(git log -1 --format=%s | head -c 60))"
+              echo "빠지거나 깨진 것:$missing"
+              echo "→ Claude에게 'GitHub 최신본 기준으로 복구해줘'라고 말씀해 주세요."
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error::필수 기능 누락 또는 문법 오류:$missing"
+            exit 1
+          fi
+          echo "필수 기능 모두 정상"
+
+      - name: 텔레그램 알림
+        if: failure() && steps.check.outputs.msg != ''
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MSG: ${{ steps.check.outputs.msg }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=${MSG}" > /dev/null
+          fi
