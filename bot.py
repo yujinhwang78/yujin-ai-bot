@@ -1905,10 +1905,12 @@ def _save_pending_certs(pending: dict) -> None:
         json.dump(pending, f, ensure_ascii=False, indent=2)
 
 
-def _queue_pending_certs(items: list, target_email: str, subject: str, body: str, label: str = "가입증명서") -> str:
+def _queue_pending_certs(items: list, target_email: str, subject: str, body: str, label: str = "가입증명서",
+                         sent_keys: list | None = None) -> str:
     """가입증명서(한 담당자 앞으로 1건 이상)를 바로 보내지 않고 대기시켜둠.
     items: [{"store_name":..., "out_name":..., "pdf_bytes":...}, ...]
-    유진님이 '보내기'를 누르면 그때 첨부를 모두 묶어서 실제 발송함."""
+    유진님이 '보내기'를 누르면 그때 첨부를 모두 묶어서 실제 발송함.
+    sent_keys: 발송이력 키(_sj_sent_key). 이미 보낸 매장이면 보내기 전에 한 번 더 물어봄(2026-11-23)."""
     os.makedirs(PENDING_CERTS_DIR, exist_ok=True)
     cert_id = uuid.uuid4().hex[:10]
     attachments = []
@@ -1925,6 +1927,7 @@ def _queue_pending_certs(items: list, target_email: str, subject: str, body: str
         "body": body,
         "attachments": attachments,
         "label": label,
+        "sent_keys": list(sent_keys or []),
     }
     _save_pending_certs(pending)
     return cert_id
@@ -1956,6 +1959,10 @@ async def handle_cert_confirmation(update: Update, context: ContextTypes.DEFAULT
     if ":" not in data:
         await query.answer()
         return
+    if data.startswith("sjdup:"):
+        # ㈜세정 중복 확인 버튼 [덮어쓰기][새로 추가][무시] (2026-11-23)
+        await _sj_handle_dup_callback(query)
+        return
     action, cert_id = data.split(":", 1)
 
     pending = _load_pending_certs()
@@ -1965,9 +1972,33 @@ async def handle_cert_confirmation(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("이미 처리됐거나 없는 요청이에요.")
         return
 
-    if action == "sendcert":
+    if action in ("sendcert", "sendcertf"):
         await query.answer()
         names_text = ", ".join(entry["store_names"])
+        sent_keys = entry.get("sent_keys") or []
+        if action == "sendcert" and sent_keys:
+            # 이미 보낸 매장이면 다시 보낼지 한 번 더 확인(2026-11-23). 원래 메시지·버튼은 그대로 둠.
+            already = await asyncio.to_thread(_sj_sent_lookup, sent_keys)
+            if already:
+                lines = []
+                for k, rec in already.items():
+                    parts = k.split("|")
+                    store = " ".join(parts[2:4]) if len(parts) >= 4 else k
+                    try:
+                        when = dt.datetime.strptime(rec.get("at", "")[:10], "%Y-%m-%d")
+                        when_txt = f"{when.month}월{when.day}일"
+                    except ValueError:
+                        when_txt = rec.get("at") or "?"
+                    lines.append(f"- {store}: 이미 {when_txt} 발송됨({rec.get('to') or ''})")
+                await _send_message_retrying(
+                    context.bot, ALLOWED_USER_ID,
+                    f"⚠️ '{names_text}' {entry.get('label', '가입증명서')}\n" + "\n".join(lines) + "\n다시 보낼까요?",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📨 다시 보내기", callback_data=f"sendcertf:{cert_id}"),
+                        InlineKeyboardButton("🗑 보내지 않기", callback_data=f"cancelcert:{cert_id}"),
+                    ]]),
+                )
+                return
         try:
             mail_attachments = []
             for a in entry["attachments"]:
@@ -1980,6 +2011,8 @@ async def handle_cert_confirmation(update: Update, context: ContextTypes.DEFAULT
                 attachments=mail_attachments,
             )
             _remove_pending_cert(cert_id)
+            if sent_keys:
+                await asyncio.to_thread(_sj_sent_record, sent_keys, entry["target_email"])
             await query.edit_message_text(f"✅ '{names_text}' {entry.get('label', '가입증명서')}를 {entry['target_email']}로 보냈어요.")
         except Exception:
             logger.exception("대기 중이던 가입증명서 발송 중 오류")
@@ -5195,9 +5228,361 @@ def _sj_list_info(wb, store_name: str) -> dict:
     return {}
 
 
+# ---------- 중복 방지 (2026-11-23 유진님 요청) ----------
+# 세정 담당자가 같은 신청 메일을 두 번 보내도 통합관리리스트에 같은 매장이 두 번 적히지 않게 함.
+#  1단계: 같은 메일(Message-ID)·같은 첨부(SHA-256)는 아예 처리하지 않음 -> 처리이력은 드라이브 JSON
+#        (Render는 재배포하면 로컬 파일이 지워져서 드라이브 '가입증명서및정산' 폴더에 둠)
+#  2단계: 행을 적기 직전에 브랜드+매장명+구분+개시일/폐점일로 같은 건을 찾아
+#        ① 금액까지 같으면 건너뜀 ② 일자·금액이 다르면 [덮어쓰기][새로 추가][무시] 버튼 ③ 없으면 기재
+#  3단계: 건너뛴 매장은 드라이브 재저장·처브 발송을 하지 않고, 이미 보낸 매장은 보내기 전에 한 번 더 확인
+SEJUNG_HISTORY_NAME = "세정_처리이력.json"
+SEJUNG_DUP_CONFIRM_FILE = os.path.join(PERSIST_DIR, "sejung_dup_confirm.json")
+# 같은 건인지 볼 때 '보험료'를 정하는 칸들(이 값이 다르면 정정일 수 있어 확인받음)
+_SJ_DUP_AMOUNT_KEYS = {
+    "추가": ("재고", "시설/비품", "건물", "평수", "보험종기일"),
+    "해지": ("재물부문환급", "영업부문환급"),
+}
+_SJ_KEY_PAREN_RX = re.compile(r"[(\[（【][^)\]）】]*[)\]）】]")
+
+
+def _sj_store_key(name) -> str:
+    """중복 비교용 매장명: 괄호(안 글자 포함)·공백을 빼고, 끝의 '점'을 뗌. 예) '롯데 김해점' = '롯데김해'."""
+    s = unicodedata.normalize("NFC", str(name or ""))
+    s = _SJ_KEY_PAREN_RX.sub("", s)
+    s = re.sub(r"[\s()\[\]（）【】]", "", s).lower()
+    if len(s) > 1 and s.endswith("점"):
+        s = s[:-1]
+    return s
+
+
+def _sj_dup_num(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        t = re.sub(r"[,\s원]", "", v)
+        if t in ("", "-"):
+            return 0.0 if t == "-" else None
+        try:
+            return float(t)
+        except ValueError:
+            return None
+    return None
+
+
+def _sj_dup_same(a, b) -> bool:
+    """두 칸 값이 같은지(날짜는 날짜끼리, 금액은 쉼표 빼고 1원 차이까지 같다고 봄)."""
+    if a in (None, "") and b in (None, ""):
+        return True
+    da, db = _sj_to_date(a), _sj_to_date(b)
+    if da and db:
+        return da.date() == db.date()
+    na, nb = _sj_dup_num(a), _sj_dup_num(b)
+    if na is not None and nb is not None:
+        return abs(na - nb) <= 1
+    if a in (None, "") or b in (None, ""):
+        # 한쪽만 비어 있으면 다름(단, 금액 0과 빈칸은 같게 봄)
+        other = b if a in (None, "") else a
+        return _sj_dup_num(other) == 0.0
+    return _sj_norm(a) == _sj_norm(b)
+
+
+def _sj_master_sheet(wb, brand: str, kind: str):
+    """통합관리리스트에서 '{브랜드}_추가매장'/'{브랜드}_해지매장' 시트와 헤더(칸 이름->열 번호)."""
+    want = "추가" if kind == "추가" else "해지"
+    for n in wb.sheetnames:
+        nn = unicodedata.normalize("NFC", n)
+        if brand and brand in nn and want in nn:
+            ws = wb[n]
+            header = {}
+            for col in range(1, ws.max_column + 1):
+                label = ws.cell(row=3, column=col).value or ws.cell(row=2, column=col).value
+                if label not in (None, ""):
+                    header.setdefault(_norm_header(label), col)
+            return ws, header
+    return None, {}
+
+
+def _sj_dup_key(item_or_values: dict, kind: str | None = None, brand: str | None = None) -> str:
+    """브랜드 + 매장명 + 구분 + 개시일(추가)/폐점일(해지)."""
+    v = item_or_values
+    kind = kind or v.get("kind")
+    brand = brand or v.get("brand") or ""
+    fields = v.get("fields") if isinstance(v.get("fields"), dict) else v
+    name = v.get("store_name") or fields.get("매장명")
+    d = _sj_to_date(fields.get("보험시작일" if kind == "추가" else "폐점일"))
+    return f"{brand}|{_sj_store_key(name)}|{kind}|{d.date().isoformat() if d else ''}"
+
+
+def _sj_find_dup(wb, brand: str, kind: str, values: dict) -> dict:
+    """통합관리리스트에 같은 건이 있는지 봄.
+    반환 {"status": "new"} / {"status": "same", "sheet", "row"} / {"status": "differ", "sheet", "row", "diffs"}"""
+    ws, header = _sj_master_sheet(wb, brand, kind)
+    name_col = header.get("매장명")
+    key = _sj_store_key(values.get("매장명"))
+    if ws is None or not name_col or not key:
+        return {"status": "new"}
+    date_key = "보험시작일" if kind == "추가" else "폐점일"
+    dcol = header.get(date_key)
+    want_d = _sj_to_date(values.get(date_key))
+    best = None
+    for r in range(4, ws.max_row + 1):
+        if _sj_store_key(ws.cell(row=r, column=name_col).value) != key:
+            continue
+        diffs = []
+        if want_d is not None and dcol:
+            cd = _sj_to_date(ws.cell(row=r, column=dcol).value)
+            if cd is None or cd.date() != want_d.date():
+                diffs.append(f"{date_key}: {_sj_fmt(cd)} → {_sj_fmt(want_d)}")
+        for k in _SJ_DUP_AMOUNT_KEYS.get(kind, ()):
+            nv = values.get(k)
+            col = header.get(k)
+            if nv in (None, "") or not col:
+                continue
+            ov = ws.cell(row=r, column=col).value
+            if isinstance(ov, str) and ov.startswith("="):
+                continue
+            if not _sj_dup_same(ov, nv):
+                diffs.append(f"{k}: {_sj_fmt(ov)} → {_sj_fmt(nv)}")
+        if not diffs:
+            return {"status": "same", "sheet": ws.title, "row": r}
+        if best is None or len(diffs) < len(best[1]):
+            best = (r, diffs)
+    if best is None:
+        return {"status": "new"}
+    return {"status": "differ", "sheet": ws.title, "row": best[0], "diffs": best[1]}
+
+
+def _sj_dedupe_items(items: list) -> tuple[list, list]:
+    """한 번에 들어온 신청 안에서 같은 매장이 두 번 적혀 온 경우 첫 번째만 남김. (남긴 목록, 뺀 목록)"""
+    seen, keep, dropped = set(), [], []
+    for it in items:
+        if it.get("kind") not in ("추가", "해지"):
+            keep.append(it)
+            continue
+        k = _sj_dup_key(it)
+        if k in seen:
+            dropped.append(it)
+            continue
+        seen.add(k)
+        keep.append(it)
+    return keep, dropped
+
+
+def _sj_err_where() -> str:
+    """오류가 난 함수와 줄 번호(텔레그램 오류 알림용)."""
+    import traceback as _tb
+    tb = sys.exc_info()[2]
+    last = _tb.extract_tb(tb)[-1] if tb else None
+    return f"{last.name}() {last.lineno}번째 줄" if last else "위치 불명"
+
+
+# ----- 처리이력(드라이브 JSON) -----
+
+def _sj_history_folder(service) -> str | None:
+    return GDRIVE_FOLDER_ID or _sj_find_root(service)
+
+
+def _sj_history_load(service) -> tuple[dict, str | None]:
+    """(이력 dict, 드라이브 파일 id). 파일이 없으면 빈 이력과 None."""
+    data = {"mails": {}, "files": {}, "sent": {}}
+    folder = _sj_history_folder(service)
+    if not folder:
+        return data, None
+    resp = service.files().list(
+        q=f"'{folder}' in parents and name='{SEJUNG_HISTORY_NAME}' and trashed=false",
+        fields="files(id,name,modifiedTime)", orderBy="modifiedTime desc", pageSize=5,
+    ).execute()
+    files = resp.get("files", [])
+    if not files:
+        return data, None
+    raw = _gdrive_download_file(service, files[0]["id"])
+    if raw:
+        try:
+            loaded = json.loads(raw.decode("utf-8"))
+            for k in data:
+                if isinstance(loaded.get(k), dict):
+                    data[k] = loaded[k]
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("처리이력 JSON을 읽지 못해 빈 이력으로 시작함")
+    return data, files[0]["id"]
+
+
+def _sj_history_save(service, data: dict, file_id: str | None) -> str | None:
+    body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+    media = _gdrive_media(body, mimetype="application/json")
+    if file_id:
+        service.files().update(fileId=file_id, media_body=media).execute()
+        return file_id
+    folder = _sj_history_folder(service)
+    if not folder:
+        return None
+    f = service.files().create(
+        body={"name": SEJUNG_HISTORY_NAME, "parents": [folder]}, media_body=media, fields="id",
+    ).execute()
+    return f.get("id")
+
+
+def _sj_history_check(message_id: str | None, hashes: list) -> dict | None:
+    """이미 처리한 메일/첨부면 최초 처리 기록을, 아니면 None. 드라이브 연결이 안 되면 None(그냥 처리)."""
+    try:
+        service = _get_gdrive_service()
+        if service is None:
+            return None
+        hist, _ = _sj_history_load(service)
+    except Exception:
+        logger.exception("처리이력 확인 중 오류(이력 없이 계속 처리)")
+        return None
+    if message_id and message_id in hist["mails"]:
+        return hist["mails"][message_id]
+    if hashes and all(h in hist["files"] for h in hashes):
+        return hist["files"][hashes[0]]
+    return None
+
+
+def _sj_history_record(message_id: str | None, file_hashes: list, sender: str, stores: list) -> None:
+    """처리한 메일 Message-ID와 첨부 해시를 드라이브 처리이력에 남김. file_hashes=[(해시, 파일명)]."""
+    try:
+        service = _get_gdrive_service()
+        if service is None:
+            return
+        hist, fid = _sj_history_load(service)
+        now = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+        rec = {"at": now, "sender": sender, "stores": stores}
+        if message_id:
+            hist["mails"][message_id] = rec
+        for h, fn in file_hashes:
+            hist["files"].setdefault(h, dict(rec, name=fn))
+        _sj_history_save(service, hist, fid)
+    except Exception:
+        logger.exception("처리이력 저장 중 오류")
+
+
+def _sj_sent_lookup(keys: list) -> dict:
+    """이미 발송한 매장 {키: {"at", "to"}} (드라이브 처리이력의 sent)."""
+    if not keys:
+        return {}
+    try:
+        service = _get_gdrive_service()
+        if service is None:
+            return {}
+        hist, _ = _sj_history_load(service)
+    except Exception:
+        logger.exception("발송이력 확인 중 오류")
+        return {}
+    return {k: hist["sent"][k] for k in keys if k in hist["sent"]}
+
+
+def _sj_sent_record(keys: list, target: str) -> None:
+    if not keys:
+        return
+    try:
+        service = _get_gdrive_service()
+        if service is None:
+            return
+        hist, fid = _sj_history_load(service)
+        now = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+        for k in keys:
+            hist["sent"][k] = {"at": now, "to": target}
+        _sj_history_save(service, hist, fid)
+    except Exception:
+        logger.exception("발송이력 저장 중 오류")
+
+
+def _sj_sent_key(who: str, brand: str | None, kind: str, store: str) -> str:
+    """who: '처브'(신청서 발송) 또는 '세정'(증명서 발송)."""
+    return f"{who}|{brand or ''}|{kind}|{_sj_store_key(store)}"
+
+
+def _sj_sha256(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+# ----- ② 확인 버튼 -----
+
+def _sj_dup_keyboard(cid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ 덮어쓰기", callback_data=f"sjdup:over:{cid}"),
+        InlineKeyboardButton("➕ 새로 추가", callback_data=f"sjdup:new:{cid}"),
+        InlineKeyboardButton("🚫 무시", callback_data=f"sjdup:skip:{cid}"),
+    ]])
+
+
+def _sj_dup_apply(entry: dict, action: str) -> str:
+    """확인 버튼 결과를 통합관리리스트에 반영하고 결과 문구를 돌려줌."""
+    service = _get_gdrive_service()
+    root = _sj_find_root(service) if service else None
+    master = _sj_find_master(service, root) if root else None
+    if master is None:
+        return "❌ 드라이브 통합관리리스트를 못 찾아 반영하지 못했어요."
+    wb = openpyxl.load_workbook(io.BytesIO(_gdrive_download_file(service, master["id"])), data_only=False)
+    brand, kind, values = entry["brand"], entry["kind"], entry["values"]
+    if action == "over":
+        # 버튼을 누르기 전에 줄이 옮겨졌을 수 있어 같은 매장 줄인지 다시 확인
+        ws, header = _sj_master_sheet(wb, brand, kind)
+        row = entry.get("row")
+        ncol = header.get("매장명")
+        if not (ws and ncol and row and _sj_store_key(ws.cell(row=row, column=ncol).value)
+                == _sj_store_key(values.get("매장명"))):
+            found = _sj_find_dup(wb, brand, kind, values)
+            row = found.get("row")
+        if not row:
+            return "⚠️ 덮어쓸 기존 줄을 찾지 못했어요. [새로 추가]로 다시 처리해 주세요."
+        # 접수일자는 처음 적은 날 그대로 둠(월별 묶음이 바뀌지 않게)
+        vals = {k: v for k, v in values.items() if k != "접수일자"}
+        where = _sj_write_master(wb, brand, kind, vals, force_row=row)
+        result = f"✏️ {entry['store_name']}: {where}을(를) 새 내용으로 덮어썼어요."
+    else:
+        where = _sj_write_master(wb, brand, kind, values, update_match=False)
+        result = f"➕ {entry['store_name']}: {where}에 새로 적었어요."
+    out = io.BytesIO()
+    wb.save(out)
+    if not _save_brand_master_to_drive(master["id"], out.getvalue()):
+        return "❌ 통합관리리스트 저장에 실패했어요."
+    return result
+
+
+async def _sj_handle_dup_callback(query) -> None:
+    """[덮어쓰기][새로 추가][무시] 버튼 처리. callback_data = 'sjdup:<over|new|skip>:<id>'"""
+    await query.answer()
+    try:
+        _, action, cid = (query.data or "").split(":", 2)
+    except ValueError:
+        return
+    waiting = _sj_load(SEJUNG_DUP_CONFIRM_FILE, {})
+    entry = waiting.pop(cid, None)
+    if entry is None:
+        await query.edit_message_text("이미 처리됐거나 없는 확인 요청이에요.")
+        return
+    _sj_save(SEJUNG_DUP_CONFIRM_FILE, waiting)
+    head = f"{entry['brand']} {entry['kind']} {entry['store_name']}"
+    if action == "skip":
+        await query.edit_message_text(f"🚫 {head}: 무시했어요(통합관리리스트는 그대로).")
+        return
+    try:
+        msg = await asyncio.to_thread(_sj_dup_apply, entry, action)
+    except Exception as e:
+        logger.exception("중복 확인 반영 중 오류")
+        where = _sj_err_where()
+        waiting = _sj_load(SEJUNG_DUP_CONFIRM_FILE, {})
+        waiting[cid] = entry  # 실패하면 다시 누를 수 있게 되돌려 둠
+        _sj_save(SEJUNG_DUP_CONFIRM_FILE, waiting)
+        await query.edit_message_text(
+            f"⚠️ {head} 반영 중 오류: {type(e).__name__} ({where}): {str(e)[:120]}\n다시 눌러 주세요.",
+            reply_markup=_sj_dup_keyboard(cid),
+        )
+        return
+    await query.edit_message_text(f"{head}\n{msg}")
+
+
 def _sj_write_requests_to_master(items: list, sender_name: str | None) -> list:
     """신청서가 들어오면 바로 통합관리리스트(드라이브 정산관리 폴더)에 기재(2026-11-12 유진님 요청).
-    나중에 처브 증명서가 오면 같은 줄을 증명서 값으로 갱신함. 결과 문구 목록 반환."""
+    나중에 처브 증명서가 오면 같은 줄을 증명서 값으로 갱신함. 결과 문구 목록 반환.
+    2026-11-23 중복 방지: 적기 직전에 같은 건을 찾아서 각 item['_dup']에 결과를 남김
+      'same'(이미 기재됨, 건너뜀) / 'confirm'(일자·금액이 달라 버튼으로 확인) / 'new'(새로 기재)
+    확인이 필요한 건은 item['_confirm']에 버튼 메시지 정보를 담아 둠(보내는 건 호출한 쪽)."""
     msgs = []
     items = [i for i in items if i.get("kind") in ("추가", "해지") and i.get("brand")]
     if not items:
@@ -5211,6 +5596,8 @@ def _sj_write_requests_to_master(items: list, sender_name: str | None) -> list:
         return ["❌ 드라이브 정산관리 폴더에서 통합관리리스트를 못 찾아 적지 못했어요."]
     try:
         wb = openpyxl.load_workbook(io.BytesIO(_gdrive_download_file(service, master["id"])), data_only=False)
+        wrote = False
+        confirm_waiting = _sj_load(SEJUNG_DUP_CONFIRM_FILE, {})
         for item in items:
             info = _sj_list_info(wb, item["store_name"])
             values = {"접수자": sender_name, "접수일자": dt.datetime.now(KST).date().isoformat()}
@@ -5220,15 +5607,40 @@ def _sj_write_requests_to_master(items: list, sender_name: str | None) -> list:
                 values[k] = v
             values.update({k: _sj_json_value(v) for k, v in (item.get("fields") or {}).items()})
             values["매장명"] = item["store_name"]
-            where = _sj_write_master(wb, item["brand"], item["kind"], values, update_match=True)
+            dup = _sj_find_dup(wb, item["brand"], item["kind"], values)
+            if dup["status"] == "same":
+                item["_dup"] = "same"
+                msgs.append(f"⏭ {item['kind']} {item['store_name']}: 이미 기재됨({dup['sheet']} {dup['row']}행)")
+                continue
+            if dup["status"] == "differ":
+                cid = uuid.uuid4().hex[:10]
+                confirm_waiting[cid] = {
+                    "brand": item["brand"], "kind": item["kind"], "store_name": item["store_name"],
+                    "values": {k: _sj_json_value(v) for k, v in values.items()},
+                    "row": dup["row"], "sheet": dup["sheet"], "diffs": dup["diffs"],
+                    "at": dt.datetime.now(KST).isoformat(),
+                }
+                item["_dup"] = "confirm"
+                item["_confirm"] = {"id": cid, "sheet": dup["sheet"], "row": dup["row"], "diffs": dup["diffs"]}
+                msgs.append(f"❓ {item['kind']} {item['store_name']}: 이미 적힌 줄({dup['sheet']} {dup['row']}행)과 "
+                            "일자·금액이 달라서 확인이 필요해요(아래 버튼).")
+                continue
+            where = _sj_write_master(wb, item["brand"], item["kind"], values, update_match=False)
+            item["_dup"] = "new"
+            wrote = True
             msgs.append(f"✅ {item['kind']} {item['store_name']}: 통합관리리스트 {where}에 적었어요.")
-        out = io.BytesIO()
-        wb.save(out)
-        if not _save_brand_master_to_drive(master["id"], out.getvalue()):
-            return ["❌ 통합관리리스트 저장에 실패했어요."]
+        _sj_save(SEJUNG_DUP_CONFIRM_FILE, confirm_waiting)
+        if wrote:
+            out = io.BytesIO()
+            wb.save(out)
+            if not _save_brand_master_to_drive(master["id"], out.getvalue()):
+                for it in items:
+                    if it.get("_dup") == "new":
+                        it["_dup"] = "error"
+                return ["❌ 통합관리리스트 저장에 실패했어요."]
     except Exception as e:
         logger.exception("신청서 통합관리리스트 기재 중 오류")
-        return [f"❌ 통합관리리스트 기재 실패: {type(e).__name__}: {str(e)[:150]}"]
+        return [f"❌ 통합관리리스트 기재 실패: {type(e).__name__} ({_sj_err_where()}): {str(e)[:150]}"]
     return msgs
 
 
@@ -5250,8 +5662,9 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
         else:
             sender_email = None
     attachments = _extract_xlsx_attachments(msg) + _extract_non_xlsx_attachments(msg)
+    message_id = (msg.get("Message-ID") or msg.get("Message-Id") or "").strip() or None
     return await _sj_process_request(bot, attachments, subject, body, sender_email, sender_name,
-                                     source="메일")
+                                     source="메일", message_id=message_id)
 
 
 SEJUNG_LAST_CLOSE_FILE = os.path.join(PERSIST_DIR, "sejung_last_close.json")
@@ -5434,27 +5847,44 @@ def _sj_save_request_files(brand: str | None, request_files: list) -> str:
     try:
         # 브랜드/추가변경신청서, 브랜드/해지변경신청서 로 나눠 월별 저장(2026-11-13 유진님 요청)
         today = dt.datetime.now(KST).date()
-        saved = []
+        saved, same = [], []
+        import hashlib
         for fn, data in request_files:
             kind_folder = "해지변경신청서" if _sj_request_file_kind(fn, data) == "해지" else "추가변경신청서"
             month_id = _sj_month_folder(service, root, brand, kind_folder)
+            # 같은 내용의 파일이 이미 폴더에 있으면 다시 올리지 않음(같은 신청서 재발송, 2026-11-23)
+            md5 = hashlib.md5(data).hexdigest()
+            existing = service.files().list(
+                q=f"'{month_id}' in parents and trashed=false",
+                fields="files(id,name,md5Checksum)", pageSize=500,
+            ).execute().get("files", [])
+            if any(f.get("md5Checksum") == md5 for f in existing):
+                same.append(fn)
+                continue
             mime = _XLSX_MIMETYPE if fn.lower().endswith(".xlsx") else "application/pdf"
             service.files().create(
                 body={"name": fn, "parents": [month_id]},
                 media_body=_gdrive_media(data, mimetype=mime), fields="id",
             ).execute()
             saved.append(f"{kind_folder}/{today:%y}년 {today.month}월")
-        return f"💾 신청서 {len(request_files)}개를 드라이브 정산관리/{brand}/({', '.join(sorted(set(saved)))}) 폴더에 저장했어요."
+        parts = []
+        if saved:
+            parts.append(f"💾 신청서 {len(saved)}개를 드라이브 정산관리/{brand}/({', '.join(sorted(set(saved)))}) 폴더에 저장했어요.")
+        if same:
+            parts.append(f"💾 같은 내용의 신청서가 드라이브에 이미 있어 다시 저장하지 않았어요({', '.join(same)}).")
+        return "\n".join(parts)
     except Exception as e:
         logger.exception("신청서 드라이브 저장 중 오류")
         return f"❌ 신청서 드라이브 저장 실패: {type(e).__name__}"
 
 
 async def _sj_process_request(bot, attachments: list, subject: str, body: str,
-                              sender_email: str | None, sender_name: str | None, source: str) -> bool:
+                              sender_email: str | None, sender_name: str | None, source: str,
+                              message_id: str | None = None) -> bool:
     """변경신청서 처리 공통 흐름(메일로 온 경우, 텔레그램에 직접 올린 경우 둘 다):
     매장/신청내용 읽기 -> 보낸 사람 기억 -> 통합관리리스트 기재 -> 신청서를 드라이브에 저장 ->
-    처브 4명에게 보낼지 확인 버튼. 신청서가 아니면 False."""
+    처브 4명에게 보낼지 확인 버튼. 신청서가 아니면 False.
+    2026-11-23 중복 방지: 같은 메일/첨부는 건너뛰고, 이미 기재된 매장은 후속 작업도 하지 않음."""
     if not attachments:
         return False
     xlsx = [(fn, d) for fn, d in attachments if fn.lower().endswith(".xlsx")]
@@ -5495,6 +5925,19 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
     if not items and not has_pdf_request and not looks_like_request:
         return False
 
+    # 1단계(2026-11-23): 같은 메일(Message-ID)이나 같은 첨부(SHA-256)가 다시 오면 처리하지 않음.
+    # 이력은 드라이브 '가입증명서및정산' 폴더의 세정_처리이력.json(재배포해도 남게)
+    hash_files = request_files or [(fn, d) for fn, d in attachments if fn.lower().endswith((".xlsx", ".pdf"))]
+    file_hashes = [(_sj_sha256(d), fn) for fn, d in hash_files]
+    prev = await asyncio.to_thread(_sj_history_check, message_id, [h for h, _ in file_hashes])
+    if prev:
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"⏭ 이미 처리한 정산파일이라 건너뜀 (최초 처리: {prev.get('at') or '?'}/"
+            f"{prev.get('sender') or '보낸사람 미확인'})\n- {subject}",
+        )
+        return True
+
     brand = (next((i.get("brand") for i in items if i.get("brand")), None)
              or _sj_brand_from_text(subject, body, *pdf_texts, *[fn for fn, _ in attachments]))
     if not items:
@@ -5517,10 +5960,36 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
                           "fields": f.get("fields") or {}})
     for item in items:
         item["brand"] = item.get("brand") or brand
-        _sj_remember_request(item, sender_email, sender_name, subject)
+    # 2단계(2026-11-23): 한 파일 안에 같은 매장이 두 번 적혀 온 경우 한 번만 처리
+    items, dropped = _sj_dedupe_items(items)
+    # 통합관리리스트 기재(같은 건이 있으면 ①건너뜀 ②확인 버튼 ③새로 기재 - item['_dup']에 결과)
     list_msgs = await asyncio.to_thread(_sj_write_requests_to_master, items, sender_name)
+    for d in dropped:
+        list_msgs.append(f"⏭ {d['kind']} {d['store_name']}: 같은 파일 안에 두 번 적혀 있어 한 번만 처리했어요.")
+    new_n = sum(1 for i in items if i.get("_dup") == "new")
+    same_n = sum(1 for i in items if i.get("_dup") == "same") + len(dropped)
+    confirm_items = [i for i in items if i.get("_dup") == "confirm"]
+    summary = f"📊 신규 기재 {new_n}건 / 중복 건너뜀 {same_n}건 / 확인 필요 {len(confirm_items)}건"
+    who = f"{sender_name or ''} {sender_email or ''}".strip() or "담당자 미확인"
+    sender_label = sender_name or sender_email or source
+    # 3단계: 이미 기재돼 건너뛴 매장(①)은 보낸 사람 기억·드라이브 저장·처브 발송·접수자 질문을 다시 하지 않음
+    live = [i for i in items if i.get("_dup") != "same"]
+    for item in live:
+        _sj_remember_request(item, sender_email, sender_name, subject)
+    stores_all = [f"{i['kind']} {i['store_name']}" for i in items]
+
+    if items and not live:
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"📨 ㈜세정 변경신청서({source}): {brand or '브랜드 미확인'}, 보낸 사람: {who}\n"
+            + "\n".join(list_msgs)
+            + "\n모두 이미 기재된 매장이라 드라이브 저장·처브 발송은 하지 않았어요.\n\n" + summary,
+        )
+        await asyncio.to_thread(_sj_history_record, message_id, file_hashes, sender_label, stores_all)
+        return True
+
     save_msg = await asyncio.to_thread(_sj_save_request_files, brand, request_files)
-    closing_stores = [i["store_name"] for i in items if i.get("kind") == "해지"]
+    closing_stores = [i["store_name"] for i in live if i.get("kind") == "해지"]
     if closing_stores and brand:
         _sj_save(SEJUNG_LAST_CLOSE_FILE, {"brand": brand, "stores": closing_stores,
                                           "at": dt.datetime.now(KST).isoformat()})
@@ -5529,35 +5998,51 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         if doc_msg:
             save_msg += "\n" + doc_msg
 
-    desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in items) or "매장 미확인"
+    desc = ", ".join(f"{i['kind']} {i['store_name']}" for i in live) or "매장 미확인"
+    skipped_note = ""
+    if same_n:
+        skipped = [f"{i['kind']} {i['store_name']}" for i in items if i.get("_dup") == "same"]
+        skipped_note = (f"\n(이미 기재돼 건너뛴 매장{': ' + ', '.join(skipped) if skipped else ''}은 메일 본문에서 뺐어요. "
+                        "첨부 파일은 원본 그대로예요.)")
     cert_id = _queue_pending_certs(
         [{"store_name": desc, "out_name": fn, "pdf_bytes": data} for fn, data in attachments],
         target_email=", ".join(CHUBB_RECIPIENTS),
-        subject=_chubb_request_subject(items, brand, desc),
-        body=_chubb_request_body(items, brand),
+        subject=_chubb_request_subject(live, brand, desc),
+        body=_chubb_request_body(live, brand),
         label="변경신청서",
+        sent_keys=[_sj_sent_key("처브", i.get("brand") or brand, i["kind"], i["store_name"])
+                   for i in live if i.get("kind") in ("추가", "해지")],
     )
     files = ", ".join(fn for fn, _ in attachments)
-    who = f"{sender_name or ''} {sender_email or ''}".strip() or "담당자 미확인"
-    if not sender_email and not sender_name and items:
+    if not sender_email and not sender_name and live:
         # 텔레그램으로 직접 올린 신청서는 담당자(접수자)를 모르니 유진님께 물어봄(2026-11-16 요청)
         waiting = _sj_load(SEJUNG_AWAIT_RECEIVER_FILE, [])
-        waiting.append({"brand": brand, "items": [{"kind": i["kind"], "store_name": i["store_name"]} for i in items]})
+        waiting.append({"brand": brand, "items": [{"kind": i["kind"], "store_name": i["store_name"]} for i in live]})
         _sj_save(SEJUNG_AWAIT_RECEIVER_FILE, waiting)
-    await bot.send_message(
-        chat_id=ALLOWED_USER_ID,
-        text=(
-            f"📨 ㈜세정 변경신청서({source}): {brand or '브랜드 미확인'}, {desc}, 보낸 사람: {who}\n"
-            + "\n".join(list_msgs) + "\n" + save_msg +
-            f"\n\n첨부 {len(attachments)}개({files})를 그대로 붙여서 처브 담당자 {len(CHUBB_RECIPIENTS)}명에게 보낼까요?"
-        ),
+    await _send_message_retrying(
+        bot, ALLOWED_USER_ID,
+        f"📨 ㈜세정 변경신청서({source}): {brand or '브랜드 미확인'}, {desc}, 보낸 사람: {who}\n"
+        + "\n".join(list_msgs) + "\n" + save_msg + skipped_note +
+        f"\n\n{summary}"
+        f"\n\n첨부 {len(attachments)}개({files})를 그대로 붙여서 처브 담당자 {len(CHUBB_RECIPIENTS)}명에게 보낼까요?",
         reply_markup=_queue_confirm_keyboard(cert_id),
     )
-    if not sender_email and not sender_name and items:
-        await bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=f"❓ '{desc}' 신청서의 ㈜세정 담당자(접수자)가 누구예요? 이름을 보내주세요(예: 김가진).",
+    # ② 일자·금액이 다른 매장은 하나씩 [덮어쓰기][새로 추가][무시] 버튼으로 확인
+    for i in confirm_items:
+        c = i["_confirm"]
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"❓ {i['brand']} {i['kind']} {i['store_name']}: 이미 적힌 줄({c['sheet']} {c['row']}행)과 다른 점이 있어요.\n"
+            + "\n".join(f"  - {d}" for d in c["diffs"])
+            + "\n정정이면 [덮어쓰기], 다른 건이면 [새로 추가], 필요 없으면 [무시]를 눌러주세요.",
+            reply_markup=_sj_dup_keyboard(c["id"]),
         )
+    if not sender_email and not sender_name and live:
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"❓ '{desc}' 신청서의 ㈜세정 담당자(접수자)가 누구예요? 이름을 보내주세요(예: 김가진).",
+        )
+    await asyncio.to_thread(_sj_history_record, message_id, file_hashes, sender_label, stores_all)
     return True
 
 
@@ -6248,6 +6733,7 @@ async def _sj_queue_to_sejung(bot, target_email: str, store: str, kind: str, bra
         subject=f"[㈜세정 {brand}] {store} {label}",
         body=_sejung_cert_body(kind, refund_date, store),
         label=label,
+        sent_keys=[_sj_sent_key("세정", brand, kind, store)],
     )
     await bot.send_message(
         chat_id=ALLOWED_USER_ID,
