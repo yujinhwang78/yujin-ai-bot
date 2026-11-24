@@ -6027,9 +6027,32 @@ def _sj_find_accounts(text: str) -> list:
     return found
 
 
+def _sj_wrong_accounts(text: str, correct_acc: str) -> list:
+    """'계좌' 글자 바로 뒤(60자 안)에 적힌 계좌번호 중 정해진 계좌가 아닌 것.
+    사업자등록번호(000-00-00000)·전화번호 모양은 빼서, 계좌가 아닌 번호를 고치는 일이 없게 함."""
+    good = re.sub(r"\D", "", correct_acc)
+    out = []
+    for m in re.finditer(r"계좌", text or ""):
+        window = text[m.end(): m.end() + 60]
+        for a in re.findall(r"\d[\d\- ]{8,22}\d", window):
+            a = a.strip()
+            digits = re.sub(r"\D", "", a)
+            if not (10 <= len(digits) <= 14) or digits == good:
+                continue
+            if (re.fullmatch(r"\d{3}-\d{2}-\d{5}", a)  # 사업자등록번호
+                    or re.fullmatch(r"0(?:1[016789]|2|[3-6][1-5]|70|303|505)[- ]\d{3,4}[- ]\d{4}", a)  # 전화
+                    or re.fullmatch(r"01[016789]\d{7,8}", digits)):  # 휴대폰(하이픈 없음)
+                continue
+            if a not in out:
+                out.append(a)
+    return out
+
+
 def _sj_check_direct_accounts(items: list, texts: list) -> list:
-    """직영점 신청 건의 계좌가 정해진 계좌와 다르면 알림 문구 목록을 돌려줌(맞으면 빈 목록)."""
-    alerts = []
+    """직영점 신청 건의 계좌를 정해진 계좌와 비교(2026-11-24).
+    반환: [{"item", "bank", "acc", "status": "wrong"|"missing", "wrong": [틀린 계좌], "found": [찾은 번호]}]
+    계좌가 맞는 건은 목록에 넣지 않음(그냥 넘어감)."""
+    results = []
     joined = "\n".join(t for t in texts if t)
     compact = re.sub(r"[\s\-]", "", joined)
     for it in items:
@@ -6043,14 +6066,159 @@ def _sj_check_direct_accounts(items: list, texts: list) -> list:
         if re.sub(r"\D", "", acc) in compact:
             continue  # 정해진 계좌가 신청서에 있음 -> 통과
         extra = str((it.get("fields") or {}).get("비고") or "")
-        found = _sj_find_accounts(joined + " " + extra)
-        got = ", ".join(found) if found else "신청서에서 계좌를 찾지 못함"
-        alerts.append(
-            f"⚠️ 직영점 계좌 확인 필요: {it.get('brand') or ''} {it['kind']} {store}\n"
-            f"  - 신청서 계좌: {got}\n"
-            f"  - 정해진 계좌: {bank} {acc}"
-        )
-    return alerts
+        wrong = _sj_wrong_accounts(joined + " " + extra, acc)
+        found = wrong or _sj_find_accounts(joined + " " + extra)
+        results.append({"item": it, "bank": bank, "acc": acc,
+                        "status": "wrong" if found else "missing", "wrong": wrong, "found": found})
+    return results
+
+
+# ----- 틀린 계좌를 신청서 파일 안에서 정해진 계좌로 고치기 (2026-11-24 유진님 요청) -----
+_SJ_FIX_FONT_NAME = None
+
+
+def _sj_fix_font() -> str:
+    """신청서 글자와 비슷한 바탕 글꼴(batang.ttc)을 reportlab에 등록."""
+    global _SJ_FIX_FONT_NAME
+    if _SJ_FIX_FONT_NAME is None:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        pdfmetrics.registerFont(TTFont("SJBatang", CERT_FONT_PATH, subfontIndex=0))
+        _SJ_FIX_FONT_NAME = "SJBatang"
+    return _SJ_FIX_FONT_NAME
+
+
+def _sj_acc_rx(acc: str):
+    """계좌 숫자 사이에 하이픈·공백이 있어도 찾는 정규식."""
+    d = re.sub(r"\D", "", acc)
+    return re.compile(r"[\s\-]*".join(re.escape(c) for c in d))
+
+
+def _sj_fix_account_text(text: str, wrong: list, bank: str, acc: str) -> str:
+    new = text
+    for w in wrong:
+        new = _sj_acc_rx(w).sub(acc, new)
+    if new != text and bank not in new:
+        new = re.sub(r"[가-힣A-Za-z]*은행", bank, new, count=1)
+    return new
+
+
+def _sj_fix_pdf_account(pdf_bytes: bytes, wrong: list, bank: str, acc: str):
+    """PDF 신청서에서 틀린 계좌가 적힌 줄을 흰색으로 덮고 정해진 은행·계좌로 다시 써넣음.
+    도장(날인)·다른 글자는 건드리지 않음. 반환 (고친 PDF 또는 None, [(원래 글자, 고친 글자)])."""
+    from reportlab.pdfbase import pdfmetrics
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    changed = []
+    font = _sj_fix_font()
+    for page in reader.pages:
+        frags = []
+
+        def cb(text, cm, tm, fd, fs):
+            if text and text.strip():
+                frags.append((text, list(cm), list(tm), fs))
+
+        page.extract_text(visitor_text=cb)
+        hits = []
+        for text, cm, tm, fs in frags:
+            new = _sj_fix_account_text(text, wrong, bank, acc)
+            if new == text:
+                continue
+            x = cm[0] * tm[4] + cm[2] * tm[5] + cm[4]
+            y = cm[1] * tm[4] + cm[3] * tm[5] + cm[5]
+            size = (fs or 10) * (abs(tm[0]) or 1) * (abs(cm[0]) or 1)
+            hits.append((x, y, size, text, new))
+        if hits:
+            w, h = float(page.mediabox.width), float(page.mediabox.height)
+            buf = io.BytesIO()
+            c = pdf_canvas.Canvas(buf, pagesize=(w, h))
+            for x, y, size, old, new in hits:
+                wid = max(pdfmetrics.stringWidth(old, font, size), pdfmetrics.stringWidth(new, font, size)) * 1.1 + 4
+                c.setFillColorRGB(1, 1, 1)
+                c.rect(x - 1, y - size * 0.35, wid, size * 1.4, stroke=0, fill=1)
+                c.setFillColorRGB(0, 0, 0)
+                c.setFont(font, size)
+                c.drawString(x, y, new)
+                changed.append((old.strip(), new.strip()))
+            c.save()
+            buf.seek(0)
+            page.merge_page(PdfReader(buf).pages[0])
+        writer.add_page(page)
+    if not changed:
+        return None, []
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue(), changed
+
+
+def _sj_fix_xlsx_account(data: bytes, wrong: list, bank: str, acc: str):
+    """엑셀 신청서 안의 틀린 계좌를 정해진 은행·계좌로 바꿈. 파일 속 글자(XML)만 바꿔서
+    도장 그림·서식은 그대로 둠(openpyxl로 다시 저장하면 그림이 빠질 수 있어서)."""
+    import html as _html
+    changed = []
+    wrong_digits = {re.sub(r"\D", "", w) for w in wrong}
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            b = zin.read(info.filename)
+            name = info.filename
+            is_sheet = name.startswith("xl/worksheets/") and name.endswith(".xml")
+            if name == "xl/sharedStrings.xml" or is_sheet:
+                s = b.decode("utf-8")
+
+                def fix_t(m):
+                    txt = _html.unescape(m.group(2))
+                    new = _sj_fix_account_text(txt, wrong, bank, acc)
+                    if new == txt:
+                        return m.group(0)
+                    changed.append((txt.strip(), new.strip()))
+                    return m.group(1) + _html.escape(new, quote=False) + m.group(3)
+
+                s = re.sub(r"(<t(?:\s[^>]*)?>)([^<]*)(</t>)", fix_t, s)
+                if is_sheet:
+                    def fix_num(m):
+                        attrs, v = m.group(1), m.group(2)
+                        # 숫자 칸(t 없음 또는 t="n")에 계좌가 숫자로 들어 있는 경우 -> 글자 칸으로 바꿔 넣음
+                        if v in wrong_digits and (' t="' not in attrs or ' t="n"' in attrs):
+                            changed.append((v, acc))
+                            attrs = attrs.replace(' t="n"', "")
+                            return f'<c{attrs} t="inlineStr"><is><t>{acc}</t></is></c>'
+                        return m.group(0)
+                    s = re.sub(r"<c([^>]*)><v>(\d+)</v></c>", fix_num, s)
+                b = s.encode("utf-8")
+            zout.writestr(info, b)
+    if not changed:
+        return None, []
+    return out.getvalue(), changed
+
+
+def _sj_fix_request_accounts(request_files: list, fixes: list):
+    """틀린 계좌가 있는 신청서 파일들을 고침. fixes: _sj_check_direct_accounts의 'wrong' 결과들.
+    반환 (바뀐 파일 목록 [(이름, 내용)], {원래이름: 새이름}, 알림 문구 목록)"""
+    new_files, renamed, msgs = [], {}, []
+    for fn, data in request_files:
+        cur, changes = data, []
+        for fx in fixes:
+            if not fx["wrong"]:
+                continue
+            if fn.lower().endswith(".pdf"):
+                fixed, ch = _sj_fix_pdf_account(cur, fx["wrong"], fx["bank"], fx["acc"])
+            elif fn.lower().endswith((".xlsx", ".xlsm")):
+                fixed, ch = _sj_fix_xlsx_account(cur, fx["wrong"], fx["bank"], fx["acc"])
+            else:
+                fixed, ch = None, []
+            if fixed:
+                cur, changes = fixed, changes + ch
+        if changes:
+            stem, ext = os.path.splitext(fn)
+            new_fn = f"{stem}_계좌수정{ext}"
+            renamed[fn] = new_fn
+            new_files.append((new_fn, cur))
+            msgs.extend(f"  - '{o}' → '{n}'" for o, n in dict.fromkeys(changes))
+        else:
+            new_files.append((fn, data))
+    return new_files, renamed, msgs
 
 
 def _sj_is_excel_name(fn: str) -> bool:
@@ -6274,12 +6442,49 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         await asyncio.to_thread(_sj_history_record, message_id, file_hashes, sender_label, stores_all)
         return True
 
+    # 직영점 신청서 계좌 확인(2026-11-24): 맞으면 그냥 넘어가고, 틀리면 신청서 파일 안의 계좌를
+    # 정해진 계좌로 고친 '_계좌수정' 파일로 저장·처브 발송하고 알림. 계좌를 못 찾으면 알림만.
+    orig_request_files = list(request_files)
+    acc_alerts, acc_fixed_note = [], ""
+    try:
+        acc_texts = list(pdf_request_texts) + [
+            _sj_xlsx_text(d) for fn, d in request_files if fn.lower().endswith((".xlsx", ".xlsm"))
+        ] + [body or ""]
+        acc_results = _sj_check_direct_accounts(live, acc_texts)
+        fixes = [r for r in acc_results if r["status"] == "wrong" and r["wrong"]]
+        fix_msgs, renamed = [], {}
+        if fixes and request_files:
+            request_files, renamed, fix_msgs = await asyncio.to_thread(_sj_fix_request_accounts, request_files, fixes)
+            if renamed:
+                fixed_map = dict(request_files)
+                attachments = [(renamed.get(fn, fn), fixed_map.get(renamed.get(fn, fn), d)) for fn, d in attachments]
+        for r in acc_results:
+            it = r["item"]
+            head = f"{it.get('brand') or ''} {it['kind']} {it['store_name']}"
+            if r["status"] == "missing":
+                acc_alerts.append(f"⚠️ 직영점 계좌 확인 필요: {head}\n  - 신청서 계좌: 신청서에서 계좌를 찾지 못함\n"
+                                  f"  - 정해진 계좌: {r['bank']} {r['acc']}")
+            elif renamed:
+                acc_alerts.append(f"🔧 직영점 계좌가 달라서 신청서를 고쳤어요: {head}\n"
+                                  f"  - 정해진 계좌: {r['bank']} {r['acc']}\n" + "\n".join(fix_msgs) +
+                                  f"\n  - 고친 파일({', '.join(renamed.values())})로 드라이브 저장·처브 발송해요.")
+                acc_fixed_note = (f"\n\n※ {it['store_name']} 환급계좌를 ㈜세정 지정 계좌({r['bank']} {r['acc']})로 "
+                                  "정정한 신청서입니다.")
+            else:
+                acc_alerts.append(f"⚠️ 직영점 계좌가 정해진 계좌와 달라요(신청서 파일을 자동으로 고치지 못함): {head}\n"
+                                  f"  - 신청서 계좌: {', '.join(r['found'])}\n"
+                                  f"  - 정해진 계좌: {r['bank']} {r['acc']}\n  - 직접 확인해 주세요.")
+    except Exception as e:
+        logger.exception("직영점 계좌 확인/수정 중 오류")
+        request_files = orig_request_files
+        acc_alerts = [f"⚠️ 직영점 계좌 확인 중 오류: {type(e).__name__} ({_sj_err_where()}) - 계좌는 직접 확인해 주세요."]
+
     save_msg = await asyncio.to_thread(_sj_save_request_files, brand, request_files)
     closing_stores = [i["store_name"] for i in live if i.get("kind") == "해지"]
     if closing_stores and brand:
         _sj_save(SEJUNG_LAST_CLOSE_FILE, {"brand": brand, "stores": closing_stores,
                                           "at": dt.datetime.now(KST).isoformat()})
-        extra_docs = [(fn, d) for fn, d in others if (fn, d) not in request_files]
+        extra_docs = [(fn, d) for fn, d in others if (fn, d) not in orig_request_files]
         doc_msg = await _sj_save_closure_docs(brand, closing_stores, extra_docs)
         if doc_msg:
             save_msg += "\n" + doc_msg
@@ -6294,7 +6499,7 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         [{"store_name": desc, "out_name": fn, "pdf_bytes": data} for fn, data in attachments],
         target_email=", ".join(CHUBB_RECIPIENTS),
         subject=_chubb_request_subject(live, brand, desc),
-        body=_chubb_request_body(live, brand),
+        body=_chubb_request_body(live, brand),  # 계좌를 고쳐도 본문은 평소 문구 그대로(2026-11-24 요청)
         label="변경신청서",
         sent_keys=[_sj_sent_key("처브", i.get("brand") or brand, i["kind"], i["store_name"])
                    for i in live if i.get("kind") in ("추가", "해지")],
@@ -6328,19 +6533,9 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
             bot, ALLOWED_USER_ID,
             f"❓ '{desc}' 신청서의 ㈜세정 담당자(접수자)가 누구예요? 이름을 보내주세요(예: 김가진).",
         )
-    # 직영점 신청서 계좌 확인: 정해진 계좌와 다를 때만 알림(2026-11-24)
-    try:
-        acc_texts = list(pdf_request_texts) + [
-            _sj_xlsx_text(d) for fn, d in request_files if fn.lower().endswith(".xlsx")
-        ] + [body or ""]
-        for alert in _sj_check_direct_accounts(live, acc_texts):
-            await _send_message_retrying(bot, ALLOWED_USER_ID, alert)
-    except Exception as e:
-        logger.exception("직영점 계좌 확인 중 오류")
-        await _send_message_retrying(
-            bot, ALLOWED_USER_ID,
-            f"⚠️ 직영점 계좌 확인 중 오류: {type(e).__name__} ({_sj_err_where()}) - 계좌는 직접 확인해 주세요.",
-        )
+    # 직영점 계좌 확인 결과 알림(맞으면 알림 없음, 2026-11-24)
+    for alert in acc_alerts:
+        await _send_message_retrying(bot, ALLOWED_USER_ID, alert)
     # 세정 담당자에게 "잘 받았고 처리 후 증명서 보내드리겠다" 답장 + 텔레그램 알림(2026-11-23)
     # 이미 처리한 메일·이미 기재된 매장만 있는 메일은 위에서 끝나므로 답장이 두 번 가지 않음
     if ack_to and SEJUNG_AUTO_ACK:
