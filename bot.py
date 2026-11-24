@@ -9,6 +9,7 @@ import base64
 import zipfile
 import asyncio
 import sys
+import time
 import datetime as dt
 from zoneinfo import ZoneInfo
 import logging
@@ -2861,18 +2862,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("파일 다운로드 중 오류")
         await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요. 다시 보내주세요.")
         return
+
+    # 여러 파일을 한 번에 올렸거나(앨범) 설명에 '보내줘' 같은 지시가 있으면, 묶음을 다 받은 뒤
+    # 한꺼번에 처리함(2026-11-24: '9개 증명서를 서석란 과장한테 한번에 보내줘' 지시를 못 알아듣던 문제)
+    mg = update.message.media_group_id
+    caption = (update.message.caption or "").strip()
+    if mg or (caption and _SJ_SEND_RX.search(caption)):
+        key = str(mg or f"single-{update.message.message_id}")
+        groups = context.application.bot_data.setdefault("sj_upload_groups", {})
+        new_group = key not in groups
+        grp = groups.setdefault(key, {"files": [], "captions": []})
+        grp["files"].append((filename, file_bytes))
+        grp["last"] = time.monotonic()
+        if caption:
+            grp["captions"].append(caption)
+        if new_group:
+            context.job_queue.run_once(_sj_flush_upload_group, 4, data=key, name=f"sjgrp-{key}")
+        return
+    await _sj_process_uploaded_file(context.bot, filename, file_bytes)
+
+
+async def _sj_process_uploaded_file(bot, filename: str, file_bytes: bytes) -> None:
+    """텔레그램에 올린 파일 1개 처리(신청서 / 처브 증명서 / 해지 서류). handle_document에서 떼어냄(2026-11-24)."""
+    lower = filename.lower()
+
+    async def reply(text: str) -> None:
+        await _send_message_retrying(bot, ALLOWED_USER_ID, text)
+
     try:
         if lower.endswith(".xlsx") or _sj_pdf_is_request(_extract_pdf_text(file_bytes)):
             # 변경신청서(엑셀/PDF)를 직접 올린 경우도 메일과 똑같이 처리(리스트 기재+드라이브 저장+처브 발송 확인)
             handled = await _sj_process_request(
-                context.bot, [(filename, file_bytes)], filename, "", None, None, source="텔레그램 업로드"
+                bot, [(filename, file_bytes)], filename, "", None, None, source="텔레그램 업로드"
             )
             if not handled:
-                await update.message.reply_text(
-                    "처브 가입·해지 신청서 양식이 아니라서 처리하지 않았어요."
-                )
+                await reply("처브 가입·해지 신청서 양식이 아니라서 처리하지 않았어요.")
         else:
-            handled = lower.endswith(".pdf") and await _sj_handle_cert_file(context.bot, filename, file_bytes)
+            handled = lower.endswith(".pdf") and await _sj_handle_cert_file(bot, filename, file_bytes)
             if not handled:
                 # 해지 관련 서류(사업자등록증/통장사본 등)면 가장 최근 해지신청 매장 기준으로 저장
                 category = await _classify_closure_doc_deep(filename, file_bytes)
@@ -2886,22 +2912,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     pass
                 if category and last.get("stores") and recent:
                     msg = await _sj_save_closure_docs(last["brand"], last["stores"], [(filename, file_bytes)])
-                    await update.message.reply_text(
+                    await reply(
                         (msg or "저장할 서류가 없어요.") +
                         f"\n(가장 최근 해지신청 매장 기준: {last['brand']} {', '.join(last['stores'])})"
                     )
                 elif category:
-                    await update.message.reply_text(
+                    await reply(
                         f"'{filename}'은 {category}로 보이는데, 어느 매장 건인지 모르겠어요. "
                         "해지신청서를 먼저 올려주시면 그 매장 이름으로 저장해드릴게요."
                     )
                 else:
-                    await update.message.reply_text(
-                        "변경신청서, 처브 증명서, 해지 서류(사업자등록증·통장사본) 중 어느 것으로도 보이지 않아서 처리하지 않았어요."
+                    await reply(
+                        f"'{filename}': 변경신청서, 처브 증명서, 해지 서류(사업자등록증·통장사본) 중 "
+                        "어느 것으로도 보이지 않아서 처리하지 않았어요."
                     )
     except Exception as e:
         logger.exception("세정 파일 처리 중 오류")
-        await update.message.reply_text(f"⚠️ 처리 중 오류가 발생했어요: {type(e).__name__}: {str(e)[:150]}")
+        await reply(f"⚠️ '{filename}' 처리 중 오류가 발생했어요: {type(e).__name__} ({_sj_err_where()}): {str(e)[:150]}")
 
 
 def _send_email(to_addr: str, subject: str, body: str, attachments: list | None = None,
@@ -5159,6 +5186,14 @@ def _sj_store_from_filename(fn: str | None) -> str | None:
     return None
 
 
+def _sj_code_from_filename(fn: str | None) -> str | None:
+    """'WMO01A1_WMC천안모다아울렛점(특판)_26.11.12.pdf' -> 'WMO01A1' (맨 앞이 매장코드 모양일 때만)."""
+    base = re.sub(r"\.[A-Za-z0-9]+$", "", unicodedata.normalize("NFC", fn or ""))
+    base = re.sub(r"^\[(?:가입|해지)\]", "", base)
+    first = base.split("_")[0].strip() if base else ""
+    return first if re.fullmatch(r"[A-Z]{2,4}\d[A-Z0-9]{2,5}", first) else None
+
+
 def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> list:
     """PDF '보험계약 변경 승인신청서'를 장(page)별로 읽어 [{kind, store_name, fields}] 반환.
     매장명을 못 읽은 장도 store_name=None으로 넣음(Claude 결과와 맞춰 쓰기 위해).
@@ -5170,6 +5205,7 @@ def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> lis
     except Exception:
         return []
     file_store = _sj_store_from_filename(filename)
+    file_code = _sj_code_from_filename(filename)
     out = []
     for t in pages:
         flat = t.replace(" ", "").replace("\n", "")
@@ -5218,6 +5254,8 @@ def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> lis
                 f["폐점일"] = effective or start
         if not store and file_store and len(pages) == 1:
             store = file_store  # 한 장짜리 신청서는 파일명의 매장명을 씀
+        if file_code and len(pages) == 1:
+            f["매장코드"] = file_code  # 신청서 파일명 'WMO0171_매장명_날짜.pdf'의 매장코드(2026-11-24)
         if not store and not addr:
             continue  # 매장명·주소가 다 빈 장은 양식만 붙어 온 빈 장으로 봄
         if addr:
@@ -6368,7 +6406,8 @@ def _sj_regex_cert_fields(text: str, filename: str = "") -> dict:
     base = os.path.splitext(os.path.basename(filename or ""))[0]
     base = re.sub(r"^\[(?:가입|해지)\]", "", base)
     parts = [p for p in base.split("_") if p]
-    if parts and re.fullmatch(r"[A-Z]{2,4}\d{3,4}[A-Z]?", parts[0]):
+    # 매장코드 모양: WMJ530A, OLK0791, WMO0171, 특판 코드 WMO01A1(숫자 사이 영문)까지(2026-11-24)
+    if parts and re.fullmatch(r"[A-Z]{2,4}\d[A-Z0-9]{2,5}", parts[0]):
         out["store_code"] = parts[0]
         parts = parts[1:]
     if not store and parts and not re.fullmatch(r"[\d\-]+", parts[0]):
@@ -6392,6 +6431,40 @@ def _sj_regex_cert_fields(text: str, filename: str = "") -> dict:
     return out
 
 
+def _sj_cert_amounts(pdf_bytes: bytes) -> dict:
+    """처브 가입증명서의 재물 가입금액을 칸 이름 그대로 읽음(2026-11-24).
+    증명서는 재고를 '동산'(재고동산)으로 적는데, AI가 이 금액을 시설/비품에 넣는 경우가 있었음
+    (웰메이드 특판 9건 중 7건). 글자 배치를 유지하는 layout 모드로 읽어서
+    '동산 70,000,000원' -> 재고, '시설/비품 - 원' -> 0, '건물 - 원' -> 0 으로 확정함."""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        t = "\n".join((p.extract_text(extraction_mode="layout") or "") for p in reader.pages)
+    except Exception:
+        logger.exception("증명서 금액 칸 읽기 실패(layout)")
+        return {}
+    t = unicodedata.normalize("NFC", t)
+
+    def amt(label):
+        m = re.search(label + r"[ \t]+([\d,]+|-)[ \t]*원", t)
+        if not m:
+            return None
+        return 0 if m.group(1) == "-" else int(m.group(1).replace(",", ""))
+
+    out = {}
+    stock = amt(r"(?:재고[ \t]*)?동산")
+    if stock is None:
+        stock = amt(r"재고(?:자산)?")
+    fac = amt(r"시설[ \t]*/[ \t]*비품")
+    bld = amt(r"(?<![가-힣])건물")
+    if stock is not None:
+        out["stock"] = stock
+    if fac is not None:
+        out["facility"] = fac
+    if bld is not None:
+        out["building"] = bld
+    return out
+
+
 def _sj_extract_cert_fields(text: str, filename: str = "") -> dict | None:
     """PDF에서 뽑은 글자(순서가 뒤섞여 있음)를 Claude로 정리해서 필요한 값만 뽑음.
     AI 답이 비거나 깨지면 _sj_regex_cert_fields 값으로 채움(2026-11-18)."""
@@ -6406,7 +6479,8 @@ def _sj_extract_cert_fields(text: str, filename: str = "") -> dict | None:
         '"annual_property_premium": 제1부문 연간보험료 숫자, "annual_liability_premium": 제4부문 연간보험료 숫자, '
         '"total_premium": 총보험료 또는 배서보험료 숫자, "property_refund": 재물 환급보험료 숫자 또는 null, '
         '"liability_refund": 배상 환급보험료 숫자 또는 null, "warehouse": 창고위치}\n'
-        "금액에 '-'만 있으면 0, 모르면 null로 두세요. 숫자는 쉼표 없이 쓰고, JSON 앞뒤에 다른 글은 쓰지 마세요."
+        "금액에 '-'만 있으면 0, 모르면 null로 두세요. 숫자는 쉼표 없이 쓰고, JSON 앞뒤에 다른 글은 쓰지 마세요.\n"
+        "'동산'(재고동산) 금액은 반드시 stock(재고)이에요. facility(시설/비품)에 넣지 마세요."
     )
     data: dict = {}
     raw = ""
@@ -6720,11 +6794,32 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
 
         addr_col = header.get("매장주소")
         addr_target = _sj_norm(values.get("매장주소"))
+        code_col = header.get("매장코드")
+        code_target = str(values.get("매장코드") or "").strip().upper()
+
+        def _addr_key(v) -> str:
+            return re.sub(r"[\s,.\-()·]", "", unicodedata.normalize("NFC", str(v or ""))).lower()
+
+        addr_key_target = _addr_key(values.get("매장주소"))
         exact, pending, similar = None, None, None
+        addr_hits = []
         for r in range(template_row, ws.max_row + 1):
             row_name = ws.cell(row=r, column=name_col).value
+            if row_name in (None, ""):
+                continue
             cd = _sj_to_date(ws.cell(row=r, column=dcol).value) if dcol else None
             same_date = want_d is None or cd is None or cd.date() == want_d.date()
+            # 2026-11-24: 매장코드가 같으면 매장명이 달라도 같은 매장(예: 'WMC안산고잔' = 'WMCNC고잔점(특판)')
+            row_code = str(ws.cell(row=r, column=code_col).value or "").strip().upper() if code_col else ""
+            if code_target and row_code and row_code == code_target and same_date:
+                exact = r
+                continue
+            # 2026-11-24: 증명서 매장명이 리스트와 많이 달라도(유진님이 직접 고친 이름 등), 아직 '증명서 대기'인
+            # 줄 중 주소가 같고 날짜가 같은 줄은 같은 건 후보로 둠(1곳일 때만 씀)
+            if cert_review and addr_key_target and len(addr_key_target) >= 10 and _sj_row_pending(r) and same_date:
+                rk = _addr_key(ws.cell(row=r, column=addr_col).value) if addr_col else ""
+                if rk and len(rk) >= 10 and (rk == addr_key_target or rk in addr_key_target or addr_key_target in rk):
+                    addr_hits.append(r)
             if _sj_norm(row_name) != name_target:
                 # 2026-11-18 보강: 증명서 매장명이 신청서와 조금 달라도(예: '직영' 빠짐), 아직 '증명서 대기'인
                 # 줄 중 매장명이 사실상 같고 날짜나 주소가 같은 줄이면 같은 건으로 보고 그 줄을 고침.
@@ -6744,6 +6839,8 @@ def _sj_write_master(wb, brand: str, kind: str, values: dict, update_match: bool
             elif _sj_row_pending(r):
                 pending = r
         target = exact if exact is not None else (pending if pending is not None else similar)
+        if target is None and len(addr_hits) == 1:
+            target = addr_hits[0]
     updating = target is not None
     if target is None:
         target = template_row
@@ -6873,8 +6970,13 @@ def _sj_build_values(kind: str, cert: dict, req: dict | None) -> dict:
 
 
 def _sj_lookup_store_code(wb, store_name: str) -> str | None:
-    """통합관리리스트의 최초가입전체리스트(C=매장코드, E=매장명)와 추가매장 시트에서 매장코드를 찾음."""
-    target = _sj_norm(store_name)
+    """통합관리리스트의 최초가입전체리스트(C=매장코드, E=매장명)와 추가매장 시트에서 매장코드를 찾음.
+    2026-11-24: 매장명이 정확히 같을 때만(공백·괄호·끝 '점' 차이는 같게 봄). 이름 일부만 겹치는 다른 매장
+    코드를 가져오던 문제 수정('NC고잔점' 코드가 'WMCNC고잔점(특판)'에 붙음)."""
+    target = _sj_store_key(store_name)
+    raw_target = _sj_norm(store_name)
+    if not target:
+        return None
     for n in wb.sheetnames:
         ws = wb[n]
         nn = unicodedata.normalize("NFC", n)
@@ -6885,9 +6987,9 @@ def _sj_lookup_store_code(wb, store_name: str) -> str | None:
         else:
             continue
         for r in range(4, ws.max_row + 1):
-            name = _sj_norm(ws.cell(row=r, column=name_col).value)
+            name_v = ws.cell(row=r, column=name_col).value
             code = ws.cell(row=r, column=code_col).value
-            if name and code and (name == target or name in target or target in name):
+            if name_v and code and (_sj_norm(name_v) == raw_target or _sj_store_key(name_v) == target):
                 return str(code).strip()
     return None
 
@@ -6932,8 +7034,11 @@ def _sj_record_cert_to_drive(brand: str, kind: str, cert: dict, req: dict | None
     except Exception:
         logger.exception("통합관리리스트 열기 중 오류")
 
-    code = (req_code or (_sj_lookup_store_code(wb, store) if wb is not None else None)
-            or cert.get("store_code"))
+    # 매장코드 우선순위(2026-11-24 수정): 신청서 → 처브 증명서 파일명(처브는 신청서 파일명 코드를 그대로 씀)
+    # → 통합관리리스트에서 매장명이 '정확히' 같은 줄. 예전엔 리스트에서 이름이 '포함'만 돼도 가져와서
+    # 'WMCNC고잔점(특판)'에 정규매장 'NC고잔점'의 코드 WMJ0582가 붙었음.
+    code = (req_code or cert.get("store_code")
+            or (_sj_lookup_store_code(wb, store) if wb is not None else None))
     out_name = _sj_cert_filename(code, store, kind, cert, req)
 
     # PDF 저장
@@ -7007,6 +7112,150 @@ async def _sj_queue_to_sejung(bot, target_email: str, store: str, kind: str, bra
     )
 
 
+# ---------- 증명서 여러 개를 담당자 1명에게 메일 1통으로 묶어 보내기 (2026-11-24 유진님 요청) ----------
+
+def _sejung_cert_bundle_body(entries: list) -> str:
+    adds = [e["store"] for e in entries if e["kind"] == "추가"]
+    dels = [e for e in entries if e["kind"] != "추가"]
+    if adds and dels:
+        what = "추가매장의 보험가입증명서와 해지매장의 변경증서(환급)를"
+    elif adds:
+        what = "추가매장의 보험가입증명서를"
+    else:
+        what = "해지매장의 변경증서(환급)를"
+    lines = []
+    if adds:
+        lines.append("- 추가(보험가입증명서): " + ", ".join(adds))
+    for e in dels:
+        extra = ""
+        if e.get("refund_date"):
+            mo, d = e["refund_date"].split("/")
+            extra = f" (환급보험료 {int(mo)}월 {int(d)}일 지급 예정)"
+        lines.append(f"- 해지(변경증명서): {e['store']}{extra}")
+    return (
+        "안녕하십니까~\n"
+        f"보내주신 {what} 보내드립니다.\n\n"
+        + "\n".join(lines) + "\n\n"
+        "업무에 참고하여 주시기 바랍니다.\n\n"
+        "즐거운 하루 보내십시요\n"
+        "감사합니다.\n"
+        "수고하세요\n\n"
+        "--\n" + _CERT_EMAIL_SIGNATURE
+    )
+
+
+async def _sj_queue_bundle(bot, target_email: str, who: str, entries: list) -> None:
+    """증명서 여러 개를 메일 1통으로 묶어 발송 대기에 올리고 [보내기] 버튼을 띄움.
+    entries: [{store, kind, brand, filename, pdf_bytes, refund_date}]"""
+    if len(entries) == 1:
+        e = entries[0]
+        await _sj_queue_to_sejung(bot, target_email, e["store"], e["kind"], e["brand"], e["filename"],
+                                  e["pdf_bytes"], who, e.get("refund_date"))
+        return
+    kinds = {e["kind"] for e in entries}
+    label = ("보험가입증명서·변경증서" if len(kinds) > 1
+             else "보험가입증명서" if "추가" in kinds else "변경증서(환급)")
+    brands = "/".join(dict.fromkeys(e["brand"] for e in entries if e.get("brand")))
+    stores = [e["store"] for e in entries]
+    cert_id = _queue_pending_certs(
+        [{"store_name": e["store"], "out_name": e["filename"], "pdf_bytes": e["pdf_bytes"]} for e in entries],
+        target_email=target_email,
+        subject=f"[㈜세정 {brands}] {label} {len(entries)}건 ({stores[0]} 외 {len(entries) - 1}곳)",
+        body=_sejung_cert_bundle_body(entries),
+        label=label,
+        sent_keys=[_sj_sent_key("세정", e.get("brand"), e["kind"], e["store"]) for e in entries],
+    )
+    await _send_message_retrying(
+        bot, ALLOWED_USER_ID,
+        f"📨 세정 담당자 {who}({target_email})에게 {label} {len(entries)}건을 메일 1통으로 보낼까요?\n"
+        + "\n".join(f"  - {e['kind']} {e['store']}" for e in entries),
+        reply_markup=_queue_confirm_keyboard(cert_id),
+    )
+
+
+async def _sj_flush_cert_batch(bot, batch: list) -> None:
+    """한 메일에서 모은 증명서를 담당자(받는 사람)별로 묶어 발송 대기에 올림."""
+    groups: dict = {}
+    for e in batch:
+        groups.setdefault(e["target"].lower(), []).append(e)
+    for items in groups.values():
+        await _sj_queue_bundle(bot, items[0]["target"], items[0]["who"], items)
+
+
+_SJ_SEND_RX = re.compile(r"보내|발송|전달")
+
+
+def _sj_info_from_cert_pdf(filename: str, data: bytes) -> dict:
+    """텔레그램으로 올린 증명서 PDF에서 매장명/구분/브랜드만 가볍게 읽음(묶음 발송용, AI 안 씀)."""
+    text = _extract_pdf_text(data)
+    rx = _sj_regex_cert_fields(text, filename)
+    base = os.path.splitext(os.path.basename(filename or ""))[0]
+    if base.startswith("[해지]") or rx.get("doc_type") == "배서증명서":
+        kind = "해지"
+    else:
+        kind = "추가"
+    store = rx.get("store_name") or re.sub(r"^\[(?:가입|해지)\]", "", base)
+    brand = _sj_brand_from_text(rx.get("policy_no"), rx.get("insured"), filename, text[:3000])
+    return {"store": str(store).strip(), "kind": kind, "brand": brand}
+
+
+async def _sj_bundle_send_from_caption(bot, caption: str, files: list) -> None:
+    """'9개 추가가입증명서를 세정 서석란 과장한테 한번에 보내줘' 같은 지시로 올린 파일들을
+    담당자에게 메일 1통으로 묶어 발송 대기에 올림. 이미 처리한 증명서여도 발송만 함(리스트 재기재 없음)."""
+    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", caption)
+    target, who = (m.group(0), m.group(0)) if m else (None, None)
+    if not target:
+        name = _sj_name_from_reply(caption)
+        target = _load_contacts().get(_norm_contact_name(name)) if name else None
+        who = name
+    if not target:
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"❓ '{caption}'에서 받는 사람을 찾지 못했어요. 등록된 담당자 이름(/contacts)이나 이메일을 "
+            "같이 적어서 다시 올려주세요.",
+        )
+        return
+    entries = []
+    for fn, data in files:
+        info = await asyncio.to_thread(_sj_info_from_cert_pdf, fn, data)
+        entries.append(dict(info, filename=fn, pdf_bytes=data, refund_date=None))
+    if len(entries) == 1:
+        # 1건이어도 지시대로 보낼 수 있게 확인 버튼을 띄움
+        e = entries[0]
+        await _sj_queue_to_sejung(bot, target, e["store"], e["kind"], e["brand"] or "", e["filename"],
+                                  e["pdf_bytes"], who, None)
+        return
+    await _sj_queue_bundle(bot, target, who, entries)
+
+
+async def _sj_flush_upload_group(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """텔레그램에 여러 파일을 한 번에 올린 묶음(앨범)을 다 받은 뒤 처리.
+    설명(캡션)에 '보내줘' 같은 지시가 있으면 묶음 발송, 없으면 파일마다 평소처럼 처리."""
+    key = context.job.data
+    groups = context.application.bot_data.get("sj_upload_groups", {})
+    grp = groups.get(key)
+    if not grp:
+        return
+    if time.monotonic() - grp.get("last", 0) < 3:
+        # 아직 묶음의 파일이 들어오는 중이면 조금 더 기다림
+        context.job_queue.run_once(_sj_flush_upload_group, 3, data=key, name=f"sjgrp-{key}")
+        return
+    groups.pop(key, None)
+    caption = " ".join(c for c in grp["captions"] if c).strip()
+    try:
+        if caption and _SJ_SEND_RX.search(caption):
+            await _sj_bundle_send_from_caption(context.bot, caption, grp["files"])
+        else:
+            for fn, data in grp["files"]:
+                await _sj_process_uploaded_file(context.bot, fn, data)
+    except Exception as e:
+        logger.exception("텔레그램 묶음 파일 처리 중 오류")
+        await _send_message_retrying(
+            context.bot, ALLOWED_USER_ID,
+            f"⚠️ 올린 파일 묶음 처리 중 오류: {type(e).__name__} ({_sj_err_where()}): {str(e)[:150]}",
+        )
+
+
 def _sj_refund_date_from_text(text: str) -> str | None:
     """처브 메일 본문에서 환급 지급 예정일을 찾아 'MM/DD'로 반환(예: '환급은 11/18 오후 6시경 지급'
     -> '11/18', '11월 18일 환급' -> '11/18'). 못 찾으면 None. (2026-11-16 유진님 요청)"""
@@ -7023,9 +7272,12 @@ def _sj_refund_date_from_text(text: str) -> str | None:
     return None
 
 
-async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: str = "") -> bool:
+async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: str = "",
+                               batch: list | None = None) -> bool:
     """처브 보험가입증명서/배서증명서 PDF면 리스트 기재 + 드라이브 저장 + 세정 담당자 발송 준비.
-    처리했으면 True(증명서가 아니면 False)."""
+    처리했으면 True(증명서가 아니면 False).
+    batch: 한 메일에 증명서가 여러 개 올 때 담당자별로 묶어 메일 1통으로 보내려고 모아두는 목록
+    (2026-11-24). 주면 여기서 바로 발송 대기에 올리지 않고 batch에 담기만 함."""
     text = _extract_pdf_text(pdf_bytes)
     if not text or not _sj_is_chubb_cert_text(text):
         return False
@@ -7041,6 +7293,9 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: 
         return True
 
     cert = await asyncio.to_thread(_sj_extract_cert_fields, text, filename)
+    if cert:
+        # 재고(동산)/시설/건물 금액은 증명서 칸 이름으로 직접 읽은 값을 우선(2026-11-24 동산→비품 오기재 수정)
+        cert.update(await asyncio.to_thread(_sj_cert_amounts, pdf_bytes))
     if not cert or not cert.get("store_name"):
         await _send_message_retrying(
             bot, ALLOWED_USER_ID,
@@ -7072,7 +7327,11 @@ async def _sj_handle_cert_file(bot, filename: str, pdf_bytes: bytes, mail_body: 
     _sj_save(SEJUNG_PROCESSED_FILE, processed)
 
     target = (req or {}).get("sender_email")
-    if target:
+    if target and batch is not None:
+        batch.append({"target": target, "who": (req or {}).get("sender_name") or target, "store": store,
+                      "kind": kind, "brand": brand, "filename": filename, "pdf_bytes": pdf_bytes,
+                      "refund_date": refund_date})
+    elif target:
         await _sj_queue_to_sejung(bot, target, store, kind, brand, filename, pdf_bytes,
                                   (req or {}).get("sender_name") or target, refund_date)
     else:
@@ -7372,14 +7631,26 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                     "통합관리리스트에 자동 기재하지 않았어요. 추가/해지 매장 건이면 그 PDF만 텔레그램으로 올려주세요.",
                 )
                 continue
+            # 한 메일의 증명서들은 담당자별로 묶어서 메일 1통으로 보내도록 모아둠(2026-11-24)
+            cert_batch: list = []
             for att_filename, att_bytes in pdf_atts:
                 try:
-                    await _sj_handle_cert_file(context.bot, att_filename, att_bytes, _get_email_body(msg))
+                    await _sj_handle_cert_file(context.bot, att_filename, att_bytes, _get_email_body(msg),
+                                               batch=cert_batch)
                 except Exception as e:
                     logger.exception("처브 증명서 처리 중 오류")
                     await _send_message_retrying(
                         context.bot, ALLOWED_USER_ID,
                         f"⚠️ 메일 첨부 '{att_filename}' 처리 중 오류: {type(e).__name__}: {str(e)[:150]}",
+                    )
+            if cert_batch:
+                try:
+                    await _sj_flush_cert_batch(context.bot, cert_batch)
+                except Exception as e:
+                    logger.exception("증명서 묶음 발송 준비 중 오류")
+                    await _send_message_retrying(
+                        context.bot, ALLOWED_USER_ID,
+                        f"⚠️ 증명서 묶음 발송 준비 중 오류: {type(e).__name__} ({_sj_err_where()}): {str(e)[:150]}",
                     )
 
         last_uid_seen = latest_uid
