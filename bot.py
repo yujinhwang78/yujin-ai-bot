@@ -5899,6 +5899,119 @@ def _sj_request_file_kind(filename: str, data: bytes) -> str:
     return "해지" if "해지" in filename and "가입" not in filename else "추가"
 
 
+# ---------- 직영점 신청서 계좌 확인 (2026-11-24 유진님 요청) ----------
+# ㈜세정 직영점 추가가입/해지 신청서에 적힌 계좌가 브랜드별로 정해진 계좌와 같으면 그냥 넘어가고,
+# 다르거나 못 찾으면 텔레그램으로 알림. (비교는 숫자만: 하이픈·공백 무시)
+_SJ_DIRECT_ACCOUNTS = {
+    "올리비아로렌": ("신한은행", "040-015-088964"),
+    "오뷔엘알": ("신한은행", "040-015-088964"),
+    "웰메이드": ("신한은행", "140-001-277300"),
+    "트레몰로": ("우리은행", "043-132564-13-515"),
+}
+_SJ_ACCOUNT_WORDS_RX = re.compile(r"계좌|은행|입금|예금주|환급|위임")
+
+
+def _sj_expected_account(brand: str | None, store: str | None):
+    t = f"{brand or ''} {store or ''}"
+    if "오뷔엘알" in t or "ovlr" in t.lower():
+        return _SJ_DIRECT_ACCOUNTS["오뷔엘알"]
+    for b, acc in _SJ_DIRECT_ACCOUNTS.items():
+        if b in t:
+            return acc
+    return None
+
+
+def _sj_xlsx_text(data: bytes) -> str:
+    """엑셀 신청서의 모든 칸 글자를 이어 붙임(계좌 찾기용)."""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        parts = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                parts.extend(str(v) for v in row if v not in (None, ""))
+        return " ".join(parts)
+    except Exception:
+        logger.exception("엑셀 신청서 글자 읽기 실패(계좌 확인)")
+        return ""
+
+
+def _sj_find_accounts(text: str) -> list:
+    """'계좌/은행/입금/예금주/환급' 근처에 적힌 계좌번호 모양(숫자-숫자, 10~14자리)을 찾음."""
+    found = []
+    for m in _SJ_ACCOUNT_WORDS_RX.finditer(text or ""):
+        window = text[max(0, m.start() - 40): m.end() + 100]
+        for a in re.findall(r"\d[\d\-]{7,22}\d", window):
+            digits = re.sub(r"\D", "", a)
+            if not (10 <= len(digits) <= 14) or digits.startswith(("010", "070")):
+                continue
+            if a not in found:
+                found.append(a)
+    return found
+
+
+def _sj_check_direct_accounts(items: list, texts: list) -> list:
+    """직영점 신청 건의 계좌가 정해진 계좌와 다르면 알림 문구 목록을 돌려줌(맞으면 빈 목록)."""
+    alerts = []
+    joined = "\n".join(t for t in texts if t)
+    compact = re.sub(r"[\s\-]", "", joined)
+    for it in items:
+        store = it.get("store_name") or ""
+        if "직영" not in store or it.get("kind") not in ("추가", "해지"):
+            continue
+        exp = _sj_expected_account(it.get("brand"), store)
+        if not exp:
+            continue
+        bank, acc = exp
+        if re.sub(r"\D", "", acc) in compact:
+            continue  # 정해진 계좌가 신청서에 있음 -> 통과
+        extra = str((it.get("fields") or {}).get("비고") or "")
+        found = _sj_find_accounts(joined + " " + extra)
+        got = ", ".join(found) if found else "신청서에서 계좌를 찾지 못함"
+        alerts.append(
+            f"⚠️ 직영점 계좌 확인 필요: {it.get('brand') or ''} {it['kind']} {store}\n"
+            f"  - 신청서 계좌: {got}\n"
+            f"  - 정해진 계좌: {bank} {acc}"
+        )
+    return alerts
+
+
+def _sj_is_excel_name(fn: str) -> bool:
+    return (fn or "").lower().endswith((".xlsx", ".xlsm", ".xls"))
+
+
+def _sj_excel_to_pdf(service, fn: str, data: bytes) -> bytes | None:
+    """엑셀 신청서를 PDF로 변환(2026-11-24). Render에는 엑셀/리브레오피스가 없어서
+    구글 드라이브에 임시 구글시트로 올려 PDF로 내려받은 뒤 임시 파일은 바로 지움.
+    A4 세로, 가로폭을 한 페이지에 맞춤, 눈금선 없음."""
+    src_mime = "application/vnd.ms-excel" if fn.lower().endswith(".xls") else _XLSX_MIMETYPE
+    tmp = service.files().create(
+        body={"name": f"_PDF변환임시_{fn}", "mimeType": "application/vnd.google-apps.spreadsheet"},
+        media_body=_gdrive_media(data, mimetype=src_mime), fields="id",
+    ).execute()
+    tmp_id = tmp["id"]
+    try:
+        pdf = None
+        try:
+            url = (f"https://docs.google.com/spreadsheets/d/{tmp_id}/export?format=pdf&size=A4"
+                   "&portrait=true&fitw=true&gridlines=false&printtitle=false&sheetnames=false"
+                   "&pagenum=UNDEFINED&top_margin=0.5&bottom_margin=0.5&left_margin=0.5&right_margin=0.5")
+            resp, content = service._http.request(url)
+            if getattr(resp, "status", 0) == 200 and content[:4] == b"%PDF":
+                pdf = content
+        except Exception:
+            logger.warning("시트 PDF 내보내기(인쇄설정) 실패, 기본 내보내기로 재시도: %s", fn)
+        if pdf is None:
+            content = service.files().export(fileId=tmp_id, mimeType="application/pdf").execute()
+            if content and content[:4] == b"%PDF":
+                pdf = content
+        return pdf
+    finally:
+        try:
+            service.files().delete(fileId=tmp_id).execute()
+        except Exception:
+            logger.warning("PDF 변환 임시 시트 삭제 실패: %s", tmp_id)
+
+
 def _sj_save_request_files(brand: str | None, request_files: list) -> str:
     """신청서 파일(엑셀/PDF)을 드라이브 정산관리/브랜드/월 폴더에 원래 파일명으로 저장(2026-11-13 요청)."""
     if not request_files:
@@ -5914,29 +6027,51 @@ def _sj_save_request_files(brand: str | None, request_files: list) -> str:
     try:
         # 브랜드/추가변경신청서, 브랜드/해지변경신청서 로 나눠 월별 저장(2026-11-13 유진님 요청)
         today = dt.datetime.now(KST).date()
-        saved, same = [], []
+        saved, same, converted, convert_failed = [], [], [], []
         import hashlib
         for fn, data in request_files:
             kind_folder = "해지변경신청서" if _sj_request_file_kind(fn, data) == "해지" else "추가변경신청서"
             month_id = _sj_month_folder(service, root, brand, kind_folder)
             # 같은 내용의 파일이 이미 폴더에 있으면 다시 올리지 않음(같은 신청서 재발송, 2026-11-23)
+            # 엑셀을 PDF로 바꿔 저장한 파일은 PDF 내용이 매번 달라지므로 원본 엑셀의 md5(src_md5)로 비교
             md5 = hashlib.md5(data).hexdigest()
             existing = service.files().list(
                 q=f"'{month_id}' in parents and trashed=false",
-                fields="files(id,name,md5Checksum)", pageSize=500,
+                fields="files(id,name,md5Checksum,appProperties)", pageSize=500,
             ).execute().get("files", [])
-            if any(f.get("md5Checksum") == md5 for f in existing):
+            if any(f.get("md5Checksum") == md5 or (f.get("appProperties") or {}).get("src_md5") == md5
+                   for f in existing):
                 same.append(fn)
                 continue
-            mime = _XLSX_MIMETYPE if fn.lower().endswith(".xlsx") else "application/pdf"
+            save_name, save_data, mime, props = fn, data, "application/pdf", None
+            if _sj_is_excel_name(fn):
+                # 엑셀 신청서는 PDF로 바꿔서 저장(2026-11-24 유진님 요청). 처브로 보내는 첨부는 원본 엑셀 그대로.
+                pdf = None
+                try:
+                    pdf = _sj_excel_to_pdf(service, fn, data)
+                except Exception:
+                    logger.exception("신청서 엑셀 -> PDF 변환 중 오류: %s", fn)
+                if pdf:
+                    save_name = re.sub(r"\.(xlsx|xlsm|xls)$", "", fn, flags=re.I) + ".pdf"
+                    save_data, props = pdf, {"src_md5": md5}
+                    converted.append(save_name)
+                else:
+                    mime = _XLSX_MIMETYPE if fn.lower().endswith((".xlsx", ".xlsm")) else "application/vnd.ms-excel"
+                    convert_failed.append(fn)
+            body_meta = {"name": save_name, "parents": [month_id]}
+            if props:
+                body_meta["appProperties"] = props
             service.files().create(
-                body={"name": fn, "parents": [month_id]},
-                media_body=_gdrive_media(data, mimetype=mime), fields="id",
+                body=body_meta, media_body=_gdrive_media(save_data, mimetype=mime), fields="id",
             ).execute()
             saved.append(f"{kind_folder}/{today:%y}년 {today.month}월")
         parts = []
         if saved:
             parts.append(f"💾 신청서 {len(saved)}개를 드라이브 정산관리/{brand}/({', '.join(sorted(set(saved)))}) 폴더에 저장했어요.")
+        if converted:
+            parts.append(f"📄 엑셀 신청서는 PDF로 바꿔 저장했어요({', '.join(converted)}).")
+        if convert_failed:
+            parts.append(f"⚠️ PDF 변환에 실패해 엑셀 원본으로 저장했어요({', '.join(convert_failed)}).")
         if same:
             parts.append(f"💾 같은 내용의 신청서가 드라이브에 이미 있어 다시 저장하지 않았어요({', '.join(same)}).")
         return "\n".join(parts)
@@ -6108,6 +6243,19 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
         await _send_message_retrying(
             bot, ALLOWED_USER_ID,
             f"❓ '{desc}' 신청서의 ㈜세정 담당자(접수자)가 누구예요? 이름을 보내주세요(예: 김가진).",
+        )
+    # 직영점 신청서 계좌 확인: 정해진 계좌와 다를 때만 알림(2026-11-24)
+    try:
+        acc_texts = list(pdf_request_texts) + [
+            _sj_xlsx_text(d) for fn, d in request_files if fn.lower().endswith(".xlsx")
+        ] + [body or ""]
+        for alert in _sj_check_direct_accounts(live, acc_texts):
+            await _send_message_retrying(bot, ALLOWED_USER_ID, alert)
+    except Exception as e:
+        logger.exception("직영점 계좌 확인 중 오류")
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"⚠️ 직영점 계좌 확인 중 오류: {type(e).__name__} ({_sj_err_where()}) - 계좌는 직접 확인해 주세요.",
         )
     # 세정 담당자에게 "잘 받았고 처리 후 증명서 보내드리겠다" 답장 + 텔레그램 알림(2026-11-23)
     # 이미 처리한 메일·이미 기재된 매장만 있는 메일은 위에서 끝나므로 답장이 두 번 가지 않음
