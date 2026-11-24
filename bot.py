@@ -4759,7 +4759,9 @@ CHUBB_RECIPIENTS = [
 SEJUNG_BRANDS = ("웰메이드", "올리비아로렌", "트레몰로")
 SEJUNG_POLICY_BRAND = {"310D260840": "웰메이드", "310D260841": "올리비아로렌", "310D260842": "트레몰로"}
 # 한 메일에 처브 증명서 PDF가 이보다 많으면 원계약 전체 발송으로 보고 자동 기재하지 않음(2026-11-18)
-SEJUNG_BULK_CERT_LIMIT = 5
+# 한 메일의 PDF가 이 개수보다 많으면 원계약 전체 증명서(대량)로 보고 자동 기재하지 않음.
+# 2026-11-24: 5개 → 30개로 늘림(특판 9개 매장 추가 증명서가 막혔음). 원계약 전체는 수백 장이라 계속 걸러짐.
+SEJUNG_BULK_CERT_LIMIT = int(os.getenv("SEJUNG_BULK_CERT_LIMIT", "30"))
 SEJUNG_BRAND_SYNONYMS = {"월메이드": "웰메이드", "오뷔엘알": "올리비아로렌", "OVLR": "올리비아로렌", "올리비아": "올리비아로렌"}
 SEJUNG_REQUESTS_FILE = os.path.join(PERSIST_DIR, "sejung_requests.json")
 SEJUNG_AWAIT_FILE = os.path.join(PERSIST_DIR, "sejung_await_contact.json")
@@ -5082,8 +5084,9 @@ def _sj_extract_request_from_text(subject: str, body: str, pdf_texts: list) -> l
     content = f"제목: {subject}\n본문:\n{(body or '')[:3000]}\n\nPDF 내용:\n" + "\n---\n".join(t[:4000] for t in pdf_texts)
     try:
         resp = client.messages.create(
-            model=MODEL_NAME, max_tokens=1500, system=system,
-            messages=[{"role": "user", "content": content[:14000]}],
+            # 매장이 여러 개(9개 등)면 답이 길어져 1500토큰에서 잘려 JSON이 깨졌음 -> 늘림(2026-11-24)
+            model=MODEL_NAME, max_tokens=6000, system=system,
+            messages=[{"role": "user", "content": content[:40000]}],
         )
         raw = "".join(b.text for b in resp.content if b.type == "text")
         m = re.search(r"\{.*\}", raw, re.S)
@@ -5094,7 +5097,7 @@ def _sj_extract_request_from_text(subject: str, body: str, pdf_texts: list) -> l
     out = []
     for st in data.get("stores") or []:
         name = str(st.get("store_name") or "").strip()
-        if not name:
+        if not _sj_valid_store_name(name):
             continue
         kind = st.get("kind") if st.get("kind") in ("추가", "해지", "비금액") else "추가"
         f = {"매장명": name, "매장주소": st.get("address"), "창고주소": st.get("warehouse")}
@@ -5132,14 +5135,41 @@ def _sj_pdf_clean_addr(s):
     return s
 
 
-def _sj_parse_request_pdf(file_bytes: bytes) -> list:
+def _sj_valid_store_name(name) -> bool:
+    """매장명으로 쓸 수 있는 글자인지. '~ 일간', '면적', '(P)'처럼 양식 글자를 매장명으로 잘못 읽은 경우를 거름
+    (2026-11-23 웰메이드 특판 9개 신청서가 모두 '~ 일간'으로 읽혀 처브 메일 제목까지 잘못 나간 건)."""
+    s = re.sub(r"\s+", "", str(name or ""))
+    if len(s) < 2 or not re.search(r"[가-힣A-Za-z]", s):
+        return False
+    bad = ("일간", "면적", "(P)", "Section", "Sum", "Insured", "Premium", "목적물", "변경기간", "~")
+    return not any(b in s for b in bad)
+
+
+def _sj_store_from_filename(fn: str | None) -> str | None:
+    """'WMO0171_WMCNC고잔점(특판)_26.11.12.pdf' -> 'WMCNC고잔점(특판)' (매장코드_매장명_날짜 형식일 때만)."""
+    base = re.sub(r"\.[A-Za-z0-9]+$", "", unicodedata.normalize("NFC", fn or ""))
+    parts = [p.strip() for p in base.split("_") if p.strip()]
+    for p in parts:
+        if re.fullmatch(r"[A-Z]{2,4}[A-Z0-9]{2,6}", p):  # 매장코드
+            continue
+        if re.fullmatch(r"[\d.\-]+", p):  # 날짜
+            continue
+        if _sj_valid_store_name(p) and re.search(r"[가-힣]", p):
+            return p
+    return None
+
+
+def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> list:
     """PDF '보험계약 변경 승인신청서'를 장(page)별로 읽어 [{kind, store_name, fields}] 반환.
-    매장명을 못 읽은 장도 store_name=None으로 넣음(Claude 결과와 맞춰 쓰기 위해)."""
+    매장명을 못 읽은 장도 store_name=None으로 넣음(Claude 결과와 맞춰 쓰기 위해).
+    2026-11-24: 매장명은 '매장명' 칸 글자를 먼저 쓰고, 못 읽으면 파일명(매장코드_매장명_날짜)에서 가져옴.
+    양식 글자('~ 일간' 등)는 매장명으로 쓰지 않음."""
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         pages = [unicodedata.normalize("NFC", p.extract_text() or "") for p in reader.pages]
     except Exception:
         return []
+    file_store = _sj_store_from_filename(filename)
     out = []
     for t in pages:
         flat = t.replace(" ", "").replace("\n", "")
@@ -5163,9 +5193,17 @@ def _sj_parse_request_pdf(file_bytes: bytes) -> list:
         wh = _sj_pdf_clean_addr(m.group(1)) if m else None
         store = None
         if kind == "추가":
-            m = re.search(r"(?:^|\n)([^\n]*?)\s*면적\s*\n?\s*\(P\)", t)
+            # 1순위: '매장명 WMCNC고잔점(특판)' 줄
+            m = re.search(r"매장명[ \t]*([^\n]+)", t)
             if m:
-                store = m.group(1).strip() or None
+                cand = re.split(r"[ \t]{2,}|면적|\(P\)", m.group(1).strip())[0].strip()
+                if _sj_valid_store_name(cand):
+                    store = cand
+            # 2순위: 예전 방식('면적 (P)' 앞 줄) - 양식 글자면 버림
+            if not store:
+                m = re.search(r"(?:^|\n)([^\n]*?)\s*면적\s*\n?\s*\(P\)", t)
+                if m and _sj_valid_store_name(m.group(1)):
+                    store = m.group(1).strip()
             if start or effective:
                 f["보험시작일"] = start or effective
             if end:
@@ -5174,10 +5212,12 @@ def _sj_parse_request_pdf(file_bytes: bytes) -> list:
                 f["창고주소"] = wh
         else:
             m = re.search(r"매장명[ \t]+([^\n]+?)[ \t]+가입\s*시\s*납입보험료", t)
-            if m:
-                store = m.group(1).strip() or None
+            if m and _sj_valid_store_name(m.group(1)):
+                store = m.group(1).strip()
             if effective or start:
                 f["폐점일"] = effective or start
+        if not store and file_store and len(pages) == 1:
+            store = file_store  # 한 장짜리 신청서는 파일명의 매장명을 씀
         if not store and not addr:
             continue  # 매장명·주소가 다 빈 장은 양식만 붙어 온 빈 장으로 봄
         if addr:
@@ -6110,7 +6150,7 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
                 has_pdf_request = True
                 request_files.append((fn, data))
                 pdf_request_texts.append(t)
-                pdf_rule_items.extend(_sj_parse_request_pdf(data))
+                pdf_rule_items.extend(_sj_parse_request_pdf(data, fn))
             pdf_texts.append(t)
     text_all = f"{subject} {body}"
     # 제목/본문만으로 신청 메일로 볼 때는 반드시 ㈜세정 건이라는 표시가 있어야 함(세정 메일 주소,
@@ -6162,12 +6202,18 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
                           "fields": f.get("fields") or {}})
     for item in items:
         item["brand"] = item.get("brand") or brand
+    # 매장명을 제대로 못 읽은 건('~ 일간' 같은 양식 글자 등)은 리스트에 적지 않고 알림(2026-11-24)
+    bad_names = [i for i in items if not _sj_valid_store_name(i.get("store_name"))]
+    items = [i for i in items if _sj_valid_store_name(i.get("store_name"))]
     # 2단계(2026-11-23): 한 파일 안에 같은 매장이 두 번 적혀 온 경우 한 번만 처리
     items, dropped = _sj_dedupe_items(items)
     # 통합관리리스트 기재(같은 건이 있으면 ①건너뜀 ②확인 버튼 ③새로 기재 - item['_dup']에 결과)
     list_msgs = await asyncio.to_thread(_sj_write_requests_to_master, items, sender_name)
     for d in dropped:
         list_msgs.append(f"⏭ {d['kind']} {d['store_name']}: 같은 파일 안에 두 번 적혀 있어 한 번만 처리했어요.")
+    if bad_names:
+        list_msgs.append(f"⚠️ 매장명을 읽지 못한 신청 {len(bad_names)}건은 통합관리리스트에 적지 않았어요. "
+                         "신청서를 직접 확인해 주세요.")
     new_n = sum(1 for i in items if i.get("_dup") == "new")
     same_n = sum(1 for i in items if i.get("_dup") == "same") + len(dropped)
     confirm_items = [i for i in items if i.get("_dup") == "confirm"]
@@ -7316,7 +7362,10 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
             pdf_atts = [(fn, b) for fn, b in _extract_non_xlsx_attachments(msg) if fn.lower().endswith(".pdf")]
             # 처브가 원계약 증명서 전체(수백 장)를 한 메일에 보내면 하나씩 '추가매장'으로 기재하면 안 됨
             # (2026-11-18 OL 332장 건). 증명서가 많으면 처리하지 않고 알림만 보냄.
-            if len(pdf_atts) > SEJUNG_BULK_CERT_LIMIT:
+            # 단, 우리가 보낸 신청 메일('정산 양식 송부')에 대한 처브 답장이면 개수와 상관없이 처리함
+            # (2026-11-24 웰메이드 특판 9개 증명서가 '대량 메일'로 막혀 저장이 안 된 건)
+            is_reply_to_request = "정산 양식 송부" in (subject or "").replace("  ", " ")
+            if len(pdf_atts) > SEJUNG_BULK_CERT_LIMIT and not is_reply_to_request:
                 await _send_message_retrying(
                     context.bot, ALLOWED_USER_ID,
                     f"📦 '{subject}' 메일에 PDF가 {len(pdf_atts)}개 있어요. 원계약 전체 증명서 같은 대량 메일이라 "
