@@ -2904,8 +2904,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"⚠️ 처리 중 오류가 발생했어요: {type(e).__name__}: {str(e)[:150]}")
 
 
-def _send_email(to_addr: str, subject: str, body: str, attachments: list | None = None) -> None:
-    """attachments: [(파일명, 파일바이트), ...]"""
+def _send_email(to_addr: str, subject: str, body: str, attachments: list | None = None,
+                extra_headers: dict | None = None) -> None:
+    """attachments: [(파일명, 파일바이트), ...]
+    extra_headers: 답장으로 보낼 때 In-Reply-To/References 등(받는 쪽 메일함에서 같은 대화로 묶임)."""
     if attachments:
         msg = MIMEMultipart()
         msg.attach(MIMEText(body))
@@ -2923,6 +2925,9 @@ def _send_email(to_addr: str, subject: str, body: str, attachments: list | None 
         # 보낸사람 계정은 그대로 두고, 상대방이 "답장"을 누르면 유진님 실제 업무 메일로
         # 가도록 함(구글 별칭 인증 없이도 바로 적용됨)
         msg["Reply-To"] = MAIL_REPLY_TO
+    for hk, hv in (extra_headers or {}).items():
+        if hv:
+            msg[hk] = hv
 
     # 로그인은 항상 GMAIL_ADDRESS 계정으로 하고, 보낸사람 표시만 MAIL_FROM_ADDRESS로 바뀜
     # (구글의 "다른 이메일 주소로 보내기" 별칭 인증이 되어 있어야 함)
@@ -5652,9 +5657,11 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
     (예전엔 엑셀 신청서만 알아봐서, PDF 신청서로 온 메일을 그냥 넘겨버렸음 - 2026-11-12 김가진 건)"""
     if sender_email and "chubb.com" in sender_email.lower():
         return False
+    forwarded = False
     if _is_own_address(sender_email) or (sender_email or "").lower() == (GMAIL_ADDRESS or "").lower():
         # 유진님이 직접 전달(포워딩)한 메일이면, 본문의 원래 보낸 사람(From/보낸 사람/Sender 줄)을
         # 세정 담당자로 봄. 원래 보낸 사람을 못 찾으면 담당자 미확인으로 두고 나중에 물어봄.
+        forwarded = True
         m = re.search(r"(?:From|보낸\s*사람|Sender)\s*:\s*([^\n<]*)<?([\w.+-]+@[\w-]+\.[\w.]+)", body or "")
         if m and "chubb.com" not in m.group(2).lower() and not _is_own_address(m.group(2)):
             sender_name = m.group(1).strip().strip('"') or sender_name
@@ -5663,8 +5670,68 @@ async def _sj_handle_request_mail(bot, msg, subject: str, body: str,
             sender_email = None
     attachments = _extract_xlsx_attachments(msg) + _extract_non_xlsx_attachments(msg)
     message_id = (msg.get("Message-ID") or msg.get("Message-Id") or "").strip() or None
+    # 세정 담당자가 직접 보낸 메일이면 접수 확인 답장을 보냄(유진님이 전달한 메일은 제외, 2026-11-23)
+    ack_to = sender_email if (not forwarded and _sj_is_sejung_address(sender_email)) else None
     return await _sj_process_request(bot, attachments, subject, body, sender_email, sender_name,
-                                     source="메일", message_id=message_id)
+                                     source="메일", message_id=message_id, ack_to=ack_to)
+
+
+# ---------- 접수 확인 답장 (2026-11-23 유진님 요청) ----------
+# 세정 담당자가 추가가입/해지 신청 메일을 보내면 "잘 받았고, 처리 후 증명서 보내드리겠다"는
+# 답장을 같은 메일 대화로 바로 보내고, 보낸 뒤 텔레그램으로 알림. 끄려면 Render 환경변수 SEJUNG_AUTO_ACK=0
+SEJUNG_AUTO_ACK = os.getenv("SEJUNG_AUTO_ACK", "1").strip() != "0"
+
+
+def _sj_is_sejung_address(addr: str | None) -> bool:
+    a = (addr or "").lower()
+    return bool(a) and ("@sejung" in a or "@ovlr" in a) and not _is_own_address(a)
+
+
+def _sj_ack_body(items: list, brand: str | None) -> str:
+    adds = [i["store_name"] for i in items if i.get("kind") == "추가"]
+    dels = [i["store_name"] for i in items if i.get("kind") == "해지"]
+    what = "추가가입 및 해지" if adds and dels else "추가가입" if adds else "해지" if dels else "변경"
+    cert = ("보험가입증명서와 변경증명서를" if adds and dels else "보험가입증명서를" if adds
+            else "변경증명서를" if dels else "증명서를")
+    lines = []
+    if adds:
+        lines.append(f"- 추가가입: {', '.join(adds)}")
+    if dels:
+        lines.append(f"- 해지: {', '.join(dels)}")
+    store_block = ("\n".join(lines) + "\n\n") if lines else ""
+    brand_text = f" {brand}" if brand else ""
+    return (
+        "안녕하십니까~\n"
+        f"보내주신 ㈜세정{brand_text} {what} 신청 메일 잘 받았습니다.\n\n"
+        + store_block +
+        f"보험사에 접수하여 처리되는 대로 {cert} 보내드리겠습니다.\n\n"
+        "감사합니다.\n"
+        "수고하세요\n\n"
+        "--\n" + _CERT_EMAIL_SIGNATURE
+    )
+
+
+async def _sj_send_ack(bot, to_addr: str, to_name: str | None, orig_subject: str,
+                       message_id: str | None, items: list, brand: str | None) -> None:
+    """접수 확인 답장을 보내고 텔레그램으로 결과를 알림. 실패해도 신청서 처리는 계속됨."""
+    subj = (orig_subject or "").strip()
+    subject = subj if re.match(r"(?i)^\s*re\s*:", subj) else f"RE: {subj or '㈜세정 변경신청'}"
+    headers = {"In-Reply-To": message_id, "References": message_id} if message_id else None
+    who = f"{to_name}님({to_addr})" if to_name else to_addr
+    try:
+        await asyncio.to_thread(_send_email, to_addr, subject, _sj_ack_body(items, brand), None, headers)
+    except Exception as e:
+        logger.exception("세정 접수 확인 메일 발송 중 오류")
+        await _send_message_retrying(
+            bot, ALLOWED_USER_ID,
+            f"⚠️ {who}께 접수 확인 메일을 보내지 못했어요: {type(e).__name__} ({_sj_err_where()}): {str(e)[:120]}",
+        )
+        return
+    stores = ", ".join(f"{i['kind']} {i['store_name']}" for i in items if i.get("kind") in ("추가", "해지"))
+    await _send_message_retrying(
+        bot, ALLOWED_USER_ID,
+        f"📧 {who}께 접수 확인 메일을 보냈어요.\n- 제목: {subject}" + (f"\n- 매장: {stores}" if stores else ""),
+    )
 
 
 SEJUNG_LAST_CLOSE_FILE = os.path.join(PERSIST_DIR, "sejung_last_close.json")
@@ -5880,7 +5947,7 @@ def _sj_save_request_files(brand: str | None, request_files: list) -> str:
 
 async def _sj_process_request(bot, attachments: list, subject: str, body: str,
                               sender_email: str | None, sender_name: str | None, source: str,
-                              message_id: str | None = None) -> bool:
+                              message_id: str | None = None, ack_to: str | None = None) -> bool:
     """변경신청서 처리 공통 흐름(메일로 온 경우, 텔레그램에 직접 올린 경우 둘 다):
     매장/신청내용 읽기 -> 보낸 사람 기억 -> 통합관리리스트 기재 -> 신청서를 드라이브에 저장 ->
     처브 4명에게 보낼지 확인 버튼. 신청서가 아니면 False.
@@ -6042,6 +6109,10 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
             bot, ALLOWED_USER_ID,
             f"❓ '{desc}' 신청서의 ㈜세정 담당자(접수자)가 누구예요? 이름을 보내주세요(예: 김가진).",
         )
+    # 세정 담당자에게 "잘 받았고 처리 후 증명서 보내드리겠다" 답장 + 텔레그램 알림(2026-11-23)
+    # 이미 처리한 메일·이미 기재된 매장만 있는 메일은 위에서 끝나므로 답장이 두 번 가지 않음
+    if ack_to and SEJUNG_AUTO_ACK:
+        await _sj_send_ack(bot, ack_to, sender_name, subject, message_id, live, brand)
     await asyncio.to_thread(_sj_history_record, message_id, file_hashes, sender_label, stores_all)
     return True
 
