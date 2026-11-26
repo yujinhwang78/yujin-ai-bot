@@ -5155,7 +5155,10 @@ def _sj_pdf_date(m, i: int):
 
 
 def _sj_pdf_clean_addr(s):
-    s = re.sub(r"\s+", " ", s or "").strip()
+    # 신청서 칸이 좁아 주소가 글자 단위로 줄바꿈된 것을 붙임(2026-11-26).
+    # 예) '…장유로 469, 롯\n데아울렛김해점' -> '…장유로 469, 롯데아울렛김해점' (예전엔 '롯 데'로 띄어져 저장됨)
+    s = re.sub(r"[ \t]*\n[ \t]*", "", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
     # 칸이 비어서 다른 글자까지 잡힌 경우는 버림
     if not s or len(s) > 120 or re.search(r"Policy|KRW|Insured|\d{3}-\d{2}-\d{5}|일간|매장명", s):
         return None
@@ -5172,26 +5175,75 @@ def _sj_valid_store_name(name) -> bool:
     return not any(b in s for b in bad)
 
 
+_SJ_CODE_RX = r"[A-Z]{2,4}\d[A-Z0-9]{2,5}"
+_SJ_FILENAME_SKIP = ("오뷔엘알", "올리비아로렌", "웰메이드", "트레몰로", "세정", "신청서", "증명서", "가입", "해지")
+
+
 def _sj_store_from_filename(fn: str | None) -> str | None:
-    """'WMO0171_WMCNC고잔점(특판)_26.11.12.pdf' -> 'WMCNC고잔점(특판)' (매장코드_매장명_날짜 형식일 때만)."""
+    """파일명에서 매장명. 'WMO0171_WMCNC고잔점(특판)_26.11.12.pdf' -> 'WMCNC고잔점(특판)',
+    '◆ 오뷔엘알_OLM7201_OL롯데김해아울렛상설특판점_20261126.pdf' -> 'OL롯데김해아울렛상설특판점'
+    (2026-11-26: 앞에 '◆ 브랜드'가 붙은 파일명에서 브랜드를 매장명으로 읽던 문제 수정 - 매장코드 바로 뒤 칸을 우선)."""
     base = re.sub(r"\.[A-Za-z0-9]+$", "", unicodedata.normalize("NFC", fn or ""))
-    parts = [p.strip() for p in base.split("_") if p.strip()]
+    base = re.sub(r"^\[(?:가입|해지)\]", "", base)
+    parts = [p.strip(" ◆◇■□●○") for p in base.split("_")]
+    parts = [p for p in parts if p]
+    ok = lambda p: (_sj_valid_store_name(p) and re.search(r"[가-힣]", p)
+                    and not re.fullmatch(_SJ_CODE_RX, p) and not re.fullmatch(r"[\d.\-]+", p)
+                    and p not in _SJ_FILENAME_SKIP)
+    for i, p in enumerate(parts):
+        if re.fullmatch(_SJ_CODE_RX, p) and i + 1 < len(parts) and ok(parts[i + 1]):
+            return parts[i + 1]
     for p in parts:
-        if re.fullmatch(r"[A-Z]{2,4}[A-Z0-9]{2,6}", p):  # 매장코드
-            continue
-        if re.fullmatch(r"[\d.\-]+", p):  # 날짜
-            continue
-        if _sj_valid_store_name(p) and re.search(r"[가-힣]", p):
+        if ok(p):
             return p
     return None
 
 
 def _sj_code_from_filename(fn: str | None) -> str | None:
-    """'WMO01A1_WMC천안모다아울렛점(특판)_26.11.12.pdf' -> 'WMO01A1' (맨 앞이 매장코드 모양일 때만)."""
+    """파일명의 매장코드. 'WMO01A1_WMC천안모다…pdf' -> 'WMO01A1', '◆ 오뷔엘알_OLM7201_…pdf' -> 'OLM7201'
+    (2026-11-26: 맨 앞 칸만 보던 것을 모든 칸에서 찾도록 수정)."""
     base = re.sub(r"\.[A-Za-z0-9]+$", "", unicodedata.normalize("NFC", fn or ""))
     base = re.sub(r"^\[(?:가입|해지)\]", "", base)
-    first = base.split("_")[0].strip() if base else ""
-    return first if re.fullmatch(r"[A-Z]{2,4}\d[A-Z0-9]{2,5}", first) else None
+    for p in base.split("_"):
+        p = p.strip(" ◆◇■□●○")
+        if re.fullmatch(_SJ_CODE_RX, p):
+            return p
+    return None
+
+
+def _sj_layout_request_fields(page) -> dict:
+    """처브 '보험계약 변경 승인신청서' 한 장을 표의 칸 위치 그대로(layout) 읽어 칸별 값을 꺼냄(2026-11-26).
+    '매장명' 칸 값(옆의 '면적' 칸 전까지), 면적(평수), 재물 가입금액(건물 / 시설(인테리어)/비품 / 재고자산).
+    빈 칸이면 그 값은 넣지 않음('-'는 0)."""
+    try:
+        t = unicodedata.normalize("NFC", page.extract_text(extraction_mode="layout") or "")
+    except Exception:
+        logger.exception("신청서 표(layout) 읽기 실패")
+        return {}
+    out = {}
+
+    def krw(label):
+        m = re.search(r"(?m)^[ \t]*" + label + r"[ \t]{2,}(KRW[ \t]*[\d,]+|-)(?=[ \t]|$)", t)
+        if not m:
+            return None
+        v = m.group(1)
+        return 0 if v == "-" else int(re.sub(r"\D", "", v))
+
+    m = re.search(r"(?m)^[ \t]*매장명[ \t]{2,}(\S(?:.*?\S)?)[ \t]{2,}(?:면적|가입[ \t]*시[ \t]*납입보험료)", t)
+    if m and _sj_valid_store_name(m.group(1)):
+        out["매장명"] = m.group(1).strip()
+    m = re.search(r"면적(?:[ \t]*\(P\))?[ \t]+([\d,.]+)(?=[ \t]|$)", t, re.M)
+    if m:
+        v = m.group(1).replace(",", "")
+        try:
+            out["평수"] = float(v) if "." in v else int(v)
+        except ValueError:
+            pass
+    for key, label in (("건물", r"건물"), ("시설/비품", r"시설\(인테리어\)[ \t]*/[ \t]*비품"), ("재고", r"재고자산")):
+        v = krw(label)
+        if v is not None:
+            out[key] = v
+    return out
 
 
 def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> list:
@@ -5207,7 +5259,8 @@ def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> lis
     file_store = _sj_store_from_filename(filename)
     file_code = _sj_code_from_filename(filename)
     out = []
-    for t in pages:
+    for page_idx, t in enumerate(pages):
+        lay = _sj_layout_request_fields(reader.pages[page_idx])
         flat = t.replace(" ", "").replace("\n", "")
         if "변경승인신청서" not in flat and "RequestforPolicyAmend" not in flat:
             continue
@@ -5227,19 +5280,29 @@ def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> lis
         # PDF 만드는 방식에 따라 '창고주소 건물 내 621-81-19659'처럼 사업자번호와 한 줄로 붙기도 함
         m = re.search(r"창고주소\s*(.*?)\s*(?:법인등록번호|\d{3}-\d{2}-\d{5})", t, re.S)
         wh = _sj_pdf_clean_addr(m.group(1)) if m else None
-        store = None
+        # 1순위(2026-11-26): 신청서 표를 칸 위치 그대로 읽은 '매장명' 칸 값.
+        # 그냥 글자만 뽑으면 '매장명 OL롯데김해아울렛상설특판점 24'처럼 옆 칸(면적 24)이 붙어 매장이 2개로 읽혔음
+        store = lay.get("매장명")
         if kind == "추가":
-            # 1순위: '매장명 WMCNC고잔점(특판)' 줄
-            m = re.search(r"매장명[ \t]*([^\n]+)", t)
-            if m:
-                cand = re.split(r"[ \t]{2,}|면적|\(P\)", m.group(1).strip())[0].strip()
-                if _sj_valid_store_name(cand):
-                    store = cand
-            # 2순위: 예전 방식('면적 (P)' 앞 줄) - 양식 글자면 버림
+            # 2순위: 한 장짜리 신청서면 파일명(매장코드_매장명_날짜)의 매장명
+            if not store and file_store and len(pages) == 1:
+                store = file_store
+            # 3순위: 글자만 뽑은 '매장명 …' 줄(면적 칸 앞까지만)
+            if not store:
+                m = re.search(r"매장명[ \t]*([^\n]+)", t)
+                if m:
+                    cand = re.split(r"[ \t]{2,}|면적|\(P\)", m.group(1).strip())[0].strip()
+                    if _sj_valid_store_name(cand):
+                        store = cand
+            # 4순위: 예전 방식('면적 (P)' 앞 줄) - 양식 글자면 버림
             if not store:
                 m = re.search(r"(?:^|\n)([^\n]*?)\s*면적\s*\n?\s*\(P\)", t)
                 if m and _sj_valid_store_name(m.group(1)):
                     store = m.group(1).strip()
+            # 표에서 읽은 평수·재물 가입금액(재고/시설·비품/건물)은 AI가 읽은 값보다 우선
+            for k in ("평수", "재고", "시설/비품", "건물"):
+                if lay.get(k) is not None:
+                    f[k] = lay[k]
             if start or effective:
                 f["보험시작일"] = start or effective
             if end:
@@ -5247,9 +5310,10 @@ def _sj_parse_request_pdf(file_bytes: bytes, filename: str | None = None) -> lis
             if wh:
                 f["창고주소"] = wh
         else:
-            m = re.search(r"매장명[ \t]+([^\n]+?)[ \t]+가입\s*시\s*납입보험료", t)
-            if m and _sj_valid_store_name(m.group(1)):
-                store = m.group(1).strip()
+            if not store:
+                m = re.search(r"매장명[ \t]+([^\n]+?)[ \t]+가입\s*시\s*납입보험료", t)
+                if m and _sj_valid_store_name(m.group(1)):
+                    store = m.group(1).strip()
             if effective or start:
                 f["폐점일"] = effective or start
         if not store and file_store and len(pages) == 1:
@@ -5285,8 +5349,14 @@ def _sj_apply_pdf_rules(items: list, rule_items: list) -> list:
         used.add(hit)
         fields = it.setdefault("fields", {})
         for k, v in rule_items[hit]["fields"].items():
-            if k != "매장명":
-                fields[k] = v
+            if k == "매장명":
+                continue
+            # 주소는 칸 줄바꿈 때문에 띄어쓰기를 정확히 알 수 없어서('…매장\n앞)'이 '매장 앞)'인지 '매장앞)'인지),
+            # AI가 읽은 주소와 띄어쓰기만 다르면 AI 쪽(문맥으로 띄어쓴 주소)을 씀(2026-11-26)
+            if (k in ("매장주소", "창고주소") and fields.get(k)
+                    and re.sub(r"\s", "", str(fields[k])) == re.sub(r"\s", "", str(v))):
+                continue
+            fields[k] = v
     for i, r in enumerate(rule_items):
         if i in used or not r["store_name"]:
             continue
@@ -6411,6 +6481,15 @@ async def _sj_process_request(bot, attachments: list, subject: str, body: str,
     # 매장명을 제대로 못 읽은 건('~ 일간' 같은 양식 글자 등)은 리스트에 적지 않고 알림(2026-11-24)
     bad_names = [i for i in items if not _sj_valid_store_name(i.get("store_name"))]
     items = [i for i in items if _sj_valid_store_name(i.get("store_name"))]
+    # 매장코드가 비어 있으면 메일 제목 '(OLM7201)'이나 첨부 파일명에서 채움(2026-11-26)
+    # 코드가 딱 1개이고 코드 없는 매장도 1곳일 때만(여러 매장이면 엉뚱한 코드가 붙을 수 있어서)
+    no_code = [i for i in items if i.get("kind") in ("추가", "해지")
+               and not str((i.get("fields") or {}).get("매장코드") or "").strip()]
+    if len(no_code) == 1:
+        codes = set(re.findall(r"\((" + _SJ_CODE_RX + r")\)", subject or ""))
+        codes |= {c for c in (_sj_code_from_filename(fn) for fn, _ in request_files) if c}
+        if len(codes) == 1:
+            no_code[0].setdefault("fields", {})["매장코드"] = codes.pop()
     # 2단계(2026-11-23): 한 파일 안에 같은 매장이 두 번 적혀 온 경우 한 번만 처리
     items, dropped = _sj_dedupe_items(items)
     # 통합관리리스트 기재(같은 건이 있으면 ①건너뜀 ②확인 버튼 ③새로 기재 - item['_dup']에 결과)
@@ -6605,6 +6684,13 @@ def _sj_regex_cert_fields(text: str, filename: str = "") -> dict:
     if parts and re.fullmatch(r"[A-Z]{2,4}\d[A-Z0-9]{2,5}", parts[0]):
         out["store_code"] = parts[0]
         parts = parts[1:]
+    # '◆ 오뷔엘알_OLM7201_매장명_날짜.pdf'처럼 코드가 맨 앞이 아닌 파일명도(2026-11-26)
+    if not out.get("store_code"):
+        c = _sj_code_from_filename(filename)
+        if c:
+            out["store_code"] = c
+    if not store:
+        store = _sj_store_from_filename(filename)
     if not store and parts and not re.fullmatch(r"[\d\-]+", parts[0]):
         store = parts[0]
     if store:
