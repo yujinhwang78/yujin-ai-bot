@@ -4592,6 +4592,20 @@ def _claims_lookup(wb, animal_norm: str) -> dict:
     return info
 
 
+def _claims_policy_by_farm(wb, farm_name: str) -> tuple:
+    """개체를 못 찾았을 때(입식 후 추징 전 등) 메일의 농장명으로 농장리스트에서 증권번호를 찾음
+    (2026-11-27 추가, 예: 주화). 농장명이 정확히 같은 행이 하나일 때만 씀. 이름이 애매하면
+    (예: '박철희' -> 박철희1/박철희2) 잘못 넣지 않도록 비워 둠. (농장명, 증권번호) 반환."""
+    name = str(farm_name or "").strip()
+    if not name or "농장리스트" not in wb.sheetnames:
+        return None, None
+    hits = [row for row in wb["농장리스트"].iter_rows(min_row=4, values_only=True)
+            if len(row) > 8 and row[8] and str(row[2] or "").strip() == name]
+    if len(hits) == 1:
+        return hits[0][2], hits[0][8]
+    return None, None
+
+
 def _claims_paint_red(ws, row: int, last_col: int) -> None:
     """한 행의 A열~last_col 글씨를 빨간색으로(글꼴·크기·굵기 등은 그대로 두고 색만 바꿈)."""
     from openpyxl.styles import Font
@@ -4631,13 +4645,18 @@ def _claims_apply(wb, mails: list[dict]) -> list[dict]:
             added.append(m)
             continue
         info = _claims_lookup(wb, key)
+        if not info["policy"]:
+            f_name, f_policy = _claims_policy_by_farm(wb, info["farm"] or m["farm"])
+            if f_policy:
+                info.update(policy=f_policy, farm=info["farm"] or f_name)
         ws.cell(target, 2).value = m["occur"]
         if target > 4 and ws.cell(target - 1, 2).number_format:
             ws.cell(target, 2).number_format = ws.cell(target - 1, 2).number_format
         ws.cell(target, 3).value = _claims_fmt_id(m["animal"])
         ws.cell(target, 4).value = info["farm"] or m["farm"]
         ws.cell(target, 5).value = info["policy"]
-        ws.cell(target, 7).value = info["amount"]
+        # 개체를 못 찾아 가입금액이 없으면 '확인필요'를 적어 한눈에 보이게 함(미가입·추징 전 개체 가능성)
+        ws.cell(target, 7).value = info["amount"] if info["amount"] not in (None, "") else "확인필요"
         ws.cell(target, 9).value = m["accident"]
         if not ws.cell(target, 12).value and ws.cell(target - 1, 12).value:
             ws.cell(target, 12).value = '="26-"&TEXT(ROW()-3,"000")'
